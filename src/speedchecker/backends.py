@@ -307,6 +307,14 @@ class FallbackSpeedtest:
         self.fallback_name = fallback_name
         self._fallback = None
 
+    def __getattr__(self, name: str):
+        # Proxy attributes like ``server_id`` to the active engine so tests
+        # and callers inspecting the engine see the expected values even
+        # when the engine is wrapped in a fallback.
+        if self._fallback is not None:
+            return getattr(self._fallback, name)
+        return getattr(self.primary, name)
+
     def measure(self) -> Measurement:
         if self._fallback is not None:
             return self._fallback.measure()
