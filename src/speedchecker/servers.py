@@ -151,6 +151,18 @@ def sort_servers(servers: list[Server], mode: str, *, seed: int | None = None) -
     return sorted(result, key=keys[mode])
 
 
+def ordered_servers(hosts: list[str], servers: list[Server]) -> list[Server]:
+    """Map endpoint IDs (in the user's selection order) back to servers.
+
+    Unknown or duplicated IDs are dropped, so the result is exactly what was
+    selected, in the order it was selected.
+    """
+    by_host: dict[str, Server] = {}
+    for server in servers:
+        by_host.setdefault(server.host, server)
+    return [by_host[host] for host in dict.fromkeys(hosts) if host in by_host]
+
+
 def group_servers(servers: list[Server], mode: str) -> dict[str, list[Server]]:
     """Group like ExpressVPN does: e.g. one section per country."""
     if mode == "none":

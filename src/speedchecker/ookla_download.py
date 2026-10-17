@@ -18,21 +18,45 @@ ARCHIVES = {
 }
 
 
-def download_ookla(log=lambda message: None, *, destination: Path | None = None) -> Path:
-    """Download/extract only the executable; never run an installer or modify PATH."""
+def download_ookla(
+    log=lambda message: None,
+    *,
+    destination: Path | None = None,
+    progress=None,
+) -> Path:
+    """Download/extract only the executable; never run an installer or modify PATH.
+
+    ``progress(done_bytes, total_bytes)`` is called while the archive streams in
+    (``total_bytes`` is 0 when the server omits Content-Length).
+    """
     target = ARCHIVES.get((platform.system(), platform.machine()))
     if not target:
         raise CheckerError(f"Unsupported platform; download the CLI manually from {OFFICIAL_PAGE}")
     suffix, name = target
     url = f"https://install.speedtest.net/app/cli/ookla-speedtest-{VERSION}-{suffix}"
     dest = destination or Path(__file__).resolve().parents[2] / "vendor" / name
+    report = progress or (lambda done, total: None)
     log(f"Downloading official Ookla CLI from {url}")
     try:
         with urllib.request.urlopen(url, timeout=45) as response:
-            # Bound memory, even if the server omits Content-Length.
-            archive = response.read(60_000_001)
-        if len(archive) > 60_000_000:
-            raise CheckerError("Ookla archive exceeds 60 MB limit")
+            headers = getattr(response, "headers", None)
+            total = int(headers.get("Content-Length") or 0) if headers is not None else 0
+            chunks: list[bytes] = []
+            downloaded = 0
+            report(0, total)
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if downloaded > 60_000_000:  # bound memory even without Content-Length
+                    raise CheckerError("Ookla archive exceeds 60 MB limit")
+                chunks.append(chunk)
+                report(downloaded, total)
+        archive = b"".join(chunks)
+        if not archive:
+            raise CheckerError("Ookla archive is empty")
+        log(f"Downloaded {len(archive) / 1_000_000:.2f} MB — extracting the executable…")
         if suffix.endswith(".zip"):
             with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                 info = next((i for i in bundle.infolist() if Path(i.filename).name == name), None)
