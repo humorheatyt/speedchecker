@@ -1,2 +1,0 @@
-include LICENSE README.md README.fa.md locations.json
-recursive-include tests *.py
