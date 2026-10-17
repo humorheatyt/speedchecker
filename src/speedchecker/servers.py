@@ -1,7 +1,8 @@
 """Speedtest server discovery, grouping and ordering.
 
-The full server list is fetched live from the Speedtest.net JS API (the
-same catalogue the official Ookla clients use). Nothing here needs the
+A nearby speed-test server list is fetched from the Speedtest.net JS API (the
+catalogue used for built-in throughput tests). VPN locations instead come from
+``expressvpnctl get regions`` in the GUI. Nothing here needs the
 external ``speedtest`` binary. When the network/API is unavailable the
 caller can fall back to :func:`demo_servers` (offline simulation).
 """
@@ -83,7 +84,7 @@ def _get_json(url: str, timeout: float, log) -> object:
 
 
 def fetch_servers(timeout: float = 15.0, log=lambda msg: None) -> list[Server]:
-    """Download the complete Speedtest.net server catalogue."""
+    """Download the API's nearby speed-test servers (not VPN locations)."""
     try:
         client_lat = client_lon = None
         try:
@@ -233,3 +234,22 @@ def load_servers_file(path, log=lambda msg: None) -> list[Server]:
     servers = [Server.from_dict(item) for item in items if isinstance(item, dict)]
     log(f"Loaded {len(servers)} servers from {path}")
     return servers
+
+
+# ExpressVPN region identifiers are NOT Ookla hosts or server IDs. Keep the
+# entire identifier for `expressvpnctl connect`; the split is display-only.
+_COMPOUND_COUNTRIES = (
+    "united-states", "united-kingdom", "south-africa", "new-zealand",
+    "hong-kong", "czech-republic", "united-arab-emirates", "south-korea",
+    "saudi-arabia", "north-macedonia", "costa-rica", "sri-lanka",
+)
+
+
+def express_region(region: str) -> Server:
+    """Represent each VPN endpoint without pretending it is a speed-test host."""
+    normalized = region.strip().lower().replace(" ", "-")
+    prefix = next((c for c in _COMPOUND_COUNTRIES if normalized.startswith(c + "-")), None)
+    parts = region.strip().split("-")
+    country = (prefix or parts[0]).replace("-", " ").title()
+    city = region.strip()[len(prefix or parts[0]):].lstrip("- ").replace("-", " ")
+    return Server(host=region.strip(), country=country, city=city, sponsor="ExpressVPN")

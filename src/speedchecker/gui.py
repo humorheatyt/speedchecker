@@ -1,7 +1,7 @@
 """SpeedChecker PyQt6 GUI — modern, bilingual (EN/FA), fully live.
 
 Run it with ``python app.py`` (project root) or ``speedchecker-gui``.
-Everything is here: full server catalogue with ExpressVPN-style grouping,
+Everything is here: ExpressVPN region catalogue and grouped selection,
 single/batch tests, repeat count, timeouts, unit selection, live gauges +
 chart, history with filters, and a live log of everything that happens.
 """
@@ -13,8 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -25,6 +27,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -42,22 +45,24 @@ from .backends import DemoVPN, ExpressVPN, OoklaSpeedtest, bundled_speedtest_bin
 from .engine import BuiltinSpeedtest, DemoSpeedtestLive
 from .history import HistoryStore, filter_history
 from .i18n import is_rtl, tr
-from .models import CheckerError, Location
+from .models import CheckerError
+from .ookla_download import OFFICIAL_PAGE, download_ookla
 from .servers import (
     Server,
     demo_servers,
-    fetch_servers,
+    express_region,
     group_servers,
     load_servers_file,
     sort_servers,
 )
-from .units import SPEED_UNITS, convert_speed, format_size
+from .units import SPEED_DESCRIPTIONS, SPEED_UNITS, convert_speed, format_size
 from .widgets import GaugeWidget, LiveChart
 
 STYLE = """
 QMainWindow, QWidget { background:#0f172a; color:#e2e8f0;
   font-family:'Segoe UI',Tahoma,sans-serif; font-size:10pt; }
-QTabWidget::pane { border:1px solid #1e293b; border-radius:10px; }
+QTabWidget::pane { border:1px solid #334155; border-radius:14px; }
+QWidget { alternate-background-color:#17283e; }
 QTabBar::tab { background:#1e293b; padding:9px 18px; margin-right:3px;
   border-top-left-radius:10px; border-top-right-radius:10px; }
 QTabBar::tab:selected { background:#0ea5e9; color:white;
@@ -65,6 +70,7 @@ QTabBar::tab:selected { background:#0ea5e9; color:white;
 QPushButton { background:#0ea5e9; color:white; border:none;
   border-radius:9px; padding:9px 16px; font-weight:bold; }
 QPushButton:hover { background:#38bdf8; }
+QPushButton:pressed { background:#0284c7; }
 QPushButton:disabled { background:#334155; color:#94a3b8; }
 QPushButton#danger { background:#e11d48; }
 QPushButton#secondary { background:#334155; }
@@ -75,7 +81,10 @@ QGroupBox { border:1px solid #334155; border-radius:10px;
   margin-top:12px; padding-top:14px; font-weight:bold; }
 QProgressBar { background:#1e293b; border-radius:8px; height:16px; text-align:center; }
 QProgressBar::chunk { background:#22c55e; border-radius:8px; }
-QHeaderView::section { background:#1e293b; padding:6px; border:none; font-weight:bold; }
+QHeaderView::section { background:#243751; color:#7dd3fc; padding:8px;
+  border:none; font-weight:bold; }
+QTreeWidget::item:selected, QTableWidget::item:selected { background:#155e75; color:white; }
+QCheckBox::indicator:checked { background:#22d3ee; border-radius:4px; }
 """
 
 
@@ -87,7 +96,8 @@ class TestWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(str, float, int)  # phase, live Mbps, bytes
     record = pyqtSignal(dict)  # one finished server record
-    fetched = pyqtSignal(list)  # server list (list[dict])
+    downloaded = pyqtSignal(str)
+    fetched = pyqtSignal(list)  # VPN regions (list[dict])
     busy = pyqtSignal(bool)
 
     def __init__(self, action: str, payload: dict, parent=None):
@@ -115,7 +125,7 @@ class TestWorker(QThread):
             return OoklaSpeedtest(
                 timeout=p["test_timeout"],
                 accept_license=p["accept_license"],
-                server_id=server.id if server else "",
+                server_id=server.id if server and server.id else "",
             )
         self.log.emit("Engine: built-in (bundled with the project, no external speedtest needed)")
         return BuiltinSpeedtest(
@@ -150,12 +160,14 @@ class TestWorker(QThread):
             "upload_mbps": None,
             "latency_ms": None,
             "repeat": p["repeat"],
+            "connection": "vpn" if vpn else "direct",
         }
+        connected = False
         try:
             if vpn is not None:
-                regions = vpn.regions()
-                region = Location(server.country, server.city).find_region(regions) or server.host
+                region = server.host
                 self.log.emit(f"VPN: connecting to {region} …")
+                connected = True  # connect may establish a tunnel before raising
                 elapsed = vpn.connect(region)
                 self.log.emit(f"VPN: connected in {elapsed:.2f}s")
             samples = []
@@ -163,7 +175,10 @@ class TestWorker(QThread):
                 if self.cancel_event.is_set():
                     raise CheckerError("Test cancelled by user.")
                 self.log.emit(f"— {server.label} ({server.host}) test {i + 1}/{p['repeat']} —")
-                samples.append(self._engine(server).measure())
+                # VPN region IDs are not Ookla IDs/hosts. A custom speed-test
+                # endpoint, however, must keep its explicit server selection.
+                target = server if p["backend"] == "demo" or server.id or server.url else None
+                samples.append(self._engine(target).measure())
             record.update(
                 download_mbps=round(fmean(s.download_mbps for s in samples), 3),
                 upload_mbps=round(fmean(s.upload_mbps for s in samples), 3),
@@ -178,27 +193,58 @@ class TestWorker(QThread):
             record.update(status="error", error=str(exc))
             self.log.emit(f"✗ {server.label}: {exc}")
         finally:
-            if vpn is not None:
+            if connected:
                 try:
                     vpn.disconnect()
                     self.log.emit("VPN: disconnected")
                 except Exception as exc:
-                    self.log.emit(f"VPN disconnect failed: {exc}")
+                    record.update(status="error", error=f"VPN disconnect failed: {exc}")
+                    self.cancel_event.set()
+                    self.log.emit(record["error"])
         return record
 
     def run(self):  # noqa: C901 - one clear dispatch
         self.busy.emit(True)
         try:
             if self.action == "fetch":
-                servers = (
-                    demo_servers()
-                    if self.payload["backend"] == "demo"
-                    else fetch_servers(timeout=self.payload["conn_timeout"], log=self.log.emit)
-                )
+                if self.payload["backend"] == "demo":
+                    servers = demo_servers()
+                else:
+                    regions = ExpressVPN(command_timeout=self.payload["cmd_timeout"]).regions()
+                    servers = [express_region(r) for r in regions]
                 self.fetched.emit([s.to_dict() for s in servers])
+            elif self.action == "download":
+                self.downloaded.emit(str(download_ookla(self.log.emit)))
             elif self.action in ("single", "batch"):
                 servers = [Server.from_dict(d) for d in self.payload["servers"]]
                 vpn = self._vpn(servers)
+                if self.payload["baseline"] and not vpn:
+                    raise CheckerError("Enable ExpressVPN mode for a verified direct baseline.")
+                if not vpn and self.payload["backend"] != "demo" and any(
+                    s.sponsor.startswith("ExpressVPN") for s in servers
+                ):
+                    raise CheckerError(
+                        "Enable ExpressVPN mode to test VPN locations. "
+                        "Direct testing of a VPN region cannot measure that location."
+                    )
+                if vpn and vpn.state() != "disconnected":
+                    if not self.payload["disconnect_existing"]:
+                        raise CheckerError(
+                            "VPN already connected. Disconnect it first or enable "
+                            "Disconnect existing VPN."
+                        )
+                    vpn.disconnect()
+                if self.payload["baseline"]:
+                    if self.cancel_event.is_set():
+                        raise CheckerError("Test cancelled by user.")
+                    self.log.emit("Measuring direct connection once before VPN tests…")
+                    baseline = Server(host="direct", city="Without VPN", sponsor="Baseline")
+                    original = self.payload["repeat"]
+                    self.payload["repeat"] = 1
+                    try:
+                        self.record.emit(self._measure_server(baseline, None))
+                    finally:
+                        self.payload["repeat"] = original
                 for server in servers:
                     if self.cancel_event.is_set():
                         self.log.emit("Stopped by user.")
@@ -210,6 +256,15 @@ class TestWorker(QThread):
             self.log.emit(f"✗ {exc}")
         finally:
             self.busy.emit(False)
+
+
+class HistoryItem(QTableWidgetItem):
+    def __lt__(self, other):
+        a = self.data(Qt.ItemDataRole.UserRole)
+        b = other.data(Qt.ItemDataRole.UserRole)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return a < b
+        return super().__lt__(other)
 
 
 class MainWindow(QMainWindow):
@@ -315,6 +370,7 @@ class MainWindow(QMainWindow):
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
         self.tree = QTreeWidget()
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setColumnCount(5)
         for column, width in enumerate((280, 180, 320, 110, 110)):
             self.tree.setColumnWidth(column, width)
@@ -352,7 +408,9 @@ class MainWindow(QMainWindow):
         ):
             filt.addWidget(widget)
         layout.addLayout(filt)
-        self.history_table = QTableWidget(0, 8)
+        self.history_table = QTableWidget(0, 9)
+        self.history_table.setSortingEnabled(True)
+        self.history_table.setAlternatingRowColors(True)
         layout.addWidget(self.history_table)
         w.setLayout(layout)
         return w
@@ -385,6 +443,7 @@ class MainWindow(QMainWindow):
         self.combo_unit = QComboBox()
         self.combo_unit.addItems(list(SPEED_UNITS))
         self.combo_unit.currentTextChanged.connect(self._unit_changed)
+        self.unit_description = QLabel()
         self.combo_backend = QComboBox()
         self.combo_backend.addItems(["auto", "builtin", "ookla", "demo"])
         self.spin_repeat = QSpinBox(minimum=1, maximum=100, value=1)
@@ -396,7 +455,13 @@ class MainWindow(QMainWindow):
         self.chk_serial = QCheckBox()
         self.chk_accept = QCheckBox()
         self.chk_vpn = QCheckBox()
+        self.chk_vpn.setChecked(True)
         self.chk_disconnect = QCheckBox()
+        self.chk_baseline = QCheckBox()
+        self.btn_download = QPushButton()
+        self.btn_download.clicked.connect(self._download_ookla)
+        self.btn_ookla_page = QPushButton(objectName="secondary")
+        self.btn_ookla_page.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(OFFICIAL_PAGE)))
         self._form_rows = [
             ("language", self.combo_lang),
             ("unit", self.combo_unit),
@@ -411,9 +476,13 @@ class MainWindow(QMainWindow):
             ("accept_license", self.chk_accept),
             ("vpn_mode", self.chk_vpn),
             ("disconnect_existing", self.chk_disconnect),
+            ("baseline", self.chk_baseline),
+            ("download_ookla", self.btn_download),
+            ("ookla_page", self.btn_ookla_page),
         ]
         for _, widget in self._form_rows:
             form.addRow(QLabel(), widget)
+        form.addRow("", self.unit_description)
         w.setLayout(form)
         return w
 
@@ -456,6 +525,7 @@ class MainWindow(QMainWindow):
                 t("upload"),
                 t("latency"),
                 t("status"),
+                t("connection"),
                 t("error"),
             ]
         )
@@ -492,6 +562,9 @@ class MainWindow(QMainWindow):
             "accept_license": t("accept_license"),
             "vpn_mode": t("vpn_mode"),
             "disconnect_existing": t("disconnect_existing"),
+            "baseline": t("baseline"),
+            "download_ookla": t("download_ookla"),
+            "ookla_page": t("ookla_page"),
         }
         form = self._settings_tab_layout()
         for row, (key, _w) in enumerate(self._form_rows):
@@ -507,6 +580,8 @@ class MainWindow(QMainWindow):
         return self.combo_backend.currentData() or "auto"
 
     def _unit_changed(self, unit: str):
+        description = SPEED_DESCRIPTIONS[unit][1 if self.lang == "fa" else 0]
+        self.unit_description.setText(f"{unit} ({description})")
         self.gauge_down.set_unit(unit)
         self.gauge_up.set_unit(unit)
         self._refresh_history()
@@ -524,6 +599,8 @@ class MainWindow(QMainWindow):
             "connections": self.spin_conns.value(),
             "accept_license": self.chk_accept.isChecked(),
             "vpn_mode": self.chk_vpn.isChecked(),
+            "baseline": self.chk_baseline.isChecked(),
+            "disconnect_existing": self.chk_disconnect.isChecked(),
         }
 
     def _run_worker(self, action: str, payload: dict):
@@ -532,12 +609,23 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self._on_progress)
         self.worker.record.connect(self._on_record)
         self.worker.fetched.connect(self._on_fetched)
+        self.worker.downloaded.connect(self._on_downloaded)
         self.worker.busy.connect(self._on_busy)
         self.worker.start()
 
     def fetch_servers(self):
-        self.log_line("Fetching the full server list from Speedtest.net …")
+        self.log_line("Fetching all ExpressVPN regions from expressvpnctl …")
         self._run_worker("fetch", self._payload([]))
+
+    def _download_ookla(self):
+        if not self.chk_accept.isChecked():
+            QMessageBox.warning(self, "Ookla", tr(self.lang, "accept_first"))
+            return
+        self._run_worker("download", self._payload([]))
+
+    def _on_downloaded(self, path: str):
+        self.log_line(f"Ookla CLI ready: {path}")
+        self.combo_backend.setCurrentIndex(self.combo_backend.findData("ookla"))
 
     def load_file(self):
         path, _ = QFileDialog.getOpenFileName(self, tr(self.lang, "load_file"), "", "JSON (*.json)")
@@ -552,10 +640,7 @@ class MainWindow(QMainWindow):
 
     def _on_fetched(self, items: list):
         self.servers = [Server.from_dict(d) for d in items]
-        self.log_line(
-            f"Server list ready: {len(self.servers)} servers. "
-            "Pick any server, or run a batch test in the chosen order."
-        )
+        self.log_line(f"ExpressVPN locations ready: {len(self.servers)} endpoints.")
         self.refresh_server_tree()
         self.tabs.setCurrentIndex(1)
 
@@ -573,7 +658,6 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         servers = self._displayed_servers()
         groups = group_servers(servers, self.combo_group.currentText())
-        unit = self.combo_unit.currentText()
         for group, members in groups.items():
             parent = QTreeWidgetItem(self.tree, [group or "—", "", "", "", ""]) if group else None
             root = parent if parent else self.tree.invisibleRootItem()
@@ -591,7 +675,6 @@ class MainWindow(QMainWindow):
                 item.setData(0, Qt.ItemDataRole.UserRole, s.host)
             if parent:
                 parent.setExpanded(True)
-        _ = unit
 
     def _selected_servers(self) -> list[Server]:
         hosts = []
@@ -616,7 +699,9 @@ class MainWindow(QMainWindow):
             if not batch and self.servers:
                 servers = self._displayed_servers()[:1]
             else:
-                self.log_line("No server selected — fetch the server list first (Servers tab).")
+                self.log_line(
+                    "No location selected — fetch ExpressVPN locations first (Servers tab)."
+                )
                 self.tabs.setCurrentIndex(1)
                 return
         self.gauge_down.reset()
@@ -640,7 +725,10 @@ class MainWindow(QMainWindow):
             self.log_line("Stop requested — finishing the current operation…")
 
     def _on_busy(self, busy: bool):
-        for b in (self.btn_start, self.btn_fetch, self.btn_test_sel, self.btn_batch, self.btn_load):
+        for b in (
+            self.btn_start, self.btn_fetch, self.btn_test_sel,
+            self.btn_batch, self.btn_load, self.btn_download,
+        ):
             b.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
         if not busy:
@@ -692,6 +780,7 @@ class MainWindow(QMainWindow):
             max_latency=self.hmax_lat.value() or None,
         )
         unit = self.combo_unit.currentText()
+        self.history_table.setSortingEnabled(False)
         self.history_table.setRowCount(0)
         for record in reversed(records):
             row = self.history_table.rowCount()
@@ -706,10 +795,26 @@ class MainWindow(QMainWindow):
                 f"{convert_speed(up, unit):.2f} {unit}" if up is not None else "—",
                 f"{record['latency_ms']}" if record.get("latency_ms") is not None else "—",
                 str(record.get("status", "")),
+                str(record.get("connection", "")),
                 str(record.get("error", "")),
             ]
             for col, value in enumerate(values):
-                self.history_table.setItem(row, col, QTableWidgetItem(value))
+                item = HistoryItem(value)
+                if col in (3, 4, 5):
+                    key = {3: "download_mbps", 4: "upload_mbps", 5: "latency_ms"}[col]
+                    metric = record.get(key)
+                    item.setData(
+                        Qt.ItemDataRole.UserRole, float(metric) if metric is not None else -1
+                    )
+                if record.get("status") == "error":
+                    color = "#fb7185"
+                elif record.get("connection") == "direct":
+                    color = "#fbbf24"
+                else:
+                    color = "#34d399" if col in (3, 4, 6) else "#93c5fd"
+                item.setForeground(QColor(color))
+                self.history_table.setItem(row, col, item)
+        self.history_table.setSortingEnabled(True)
 
     def _clear_history(self):
         self.history.clear()

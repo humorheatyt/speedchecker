@@ -206,3 +206,53 @@ class I18nTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ExpressRegionTests(unittest.TestCase):
+    def test_all_endpoints_keep_exact_region(self):
+        from speedchecker.servers import express_region
+
+        regions = ["germany-frankfurt-1", "germany-berlin", "united-states-new-york", "japan-tokyo"]
+        servers = [express_region(region) for region in regions]
+        self.assertEqual([s.host for s in servers], regions)
+        self.assertEqual(len(group_servers(servers, "country")["Germany"]), 2)
+        self.assertEqual(servers[2].country, "United States")
+        self.assertTrue(all(s.id == "" and s.url == "" for s in servers))
+
+    def test_download_unsupported_platform(self):
+        from speedchecker.ookla_download import download_ookla
+
+        with patch("speedchecker.ookla_download.platform.system", return_value="Unsupported"):
+            with self.assertRaises(CheckerError):
+                download_ookla()
+
+    def test_download_extracts_only_executable(self):
+        import io
+        import tarfile
+
+        from speedchecker.ookla_download import download_ookla
+
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            payload = b"fake executable"
+            member = tarfile.TarInfo("speedtest")
+            member.size = len(payload)
+            tar.addfile(member, io.BytesIO(payload))
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "speedtest"
+            class Response:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_):
+                    pass
+                def read(self, _):
+                    return archive.getvalue()
+            with (
+                patch("speedchecker.ookla_download.platform.system", return_value="Linux"),
+                patch("speedchecker.ookla_download.platform.machine", return_value="x86_64"),
+                patch(
+                    "speedchecker.ookla_download.urllib.request.urlopen",
+                    return_value=Response(),
+                ),
+            ):
+                self.assertEqual(download_ookla(destination=target), target)
+            self.assertEqual(target.read_bytes(), b"fake executable")

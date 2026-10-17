@@ -125,6 +125,7 @@ class BuiltinSpeedtest:
                 index += 1
                 payload = rng.randbytes(min(size, 1_000_000))
                 parts = urllib.parse.urlsplit(server.url or server.base_url + "upload.php")
+                conn = None
                 try:
                     conn_cls = (
                         http.client.HTTPSConnection
@@ -144,11 +145,15 @@ class BuiltinSpeedtest:
                     )
                     response = conn.getresponse()
                     response.read()
-                    conn.close()
+                    if response.status < 200 or response.status >= 300:
+                        raise CheckerError(f"Upload rejected: HTTP {response.status}")
                     bump(len(body))
                 except Exception as exc:
                     self.log(f"  upload stream error: {exc}")
                     time.sleep(0.1)
+                finally:
+                    if conn is not None:
+                        conn.close()
 
         worker = download_worker if phase == "download" else upload_worker
         self.log(
