@@ -6,7 +6,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+  gists: write
+  actions: write
 
 jobs:
   test:
@@ -48,6 +51,12 @@ jobs:
       - name: Show pytest log on failure
         if: env.PYTEST_EXIT != '0'
         run: cat /tmp/pytest.log
+      - name: Create gist on failure
+        if: failure()
+        run: |
+          gh gist create /tmp/pytest.log --public --desc "pytest log ${{ matrix.python }} ${{ matrix.os }}" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: python app.py --cli --help
         if: env.PYTEST_EXIT == '0'
       - run: python app.py --cli --demo -s -r 2 locations.json -o ${{ runner.temp }}/report.json
