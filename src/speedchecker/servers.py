@@ -112,7 +112,9 @@ def fetch_servers(timeout: float = 15.0, log=lambda msg: None) -> list[Server]:
             msg = str(exc)
             # The old /api/js/config endpoint now returns 404 — not an error.
             if "404" in msg or "Not Found" in msg:
-                log("Client location not available — distance will be shown as — (config endpoint deprecated).")
+                log(  # noqa: E501
+                    "Client location not available — distance will be shown as — (config endpoint deprecated)."  # noqa: E501
+                )
             else:
                 log(f"Client location unavailable (continuing without distance): {exc}")
         raw = _get_json(SERVERS_API, timeout, log)

@@ -75,7 +75,8 @@ _HINTS = (
     ),
     (
         "wsa error",
-        "Windows network error (WSA) — check VPN, firewall/antivirus, or MTU, or keep the built-in engine",
+        "Windows network error (WSA) — check VPN, firewall/antivirus, "  # noqa: E501
+        "or MTU, or keep the built-in engine",
     ),
     (
         "timed out",
