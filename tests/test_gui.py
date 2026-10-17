@@ -111,6 +111,115 @@ class GuiTests(unittest.TestCase):
         engine = worker._engine(None)
         self.assertEqual(engine.server_id, "")
 
+    def test_group_selection_order_and_rebuilds(self):
+        from PyQt6.QtCore import Qt
+
+        from speedchecker.servers import demo_servers
+
+        window = MainWindow()
+        window.servers = demo_servers()
+        window.refresh_server_tree()
+
+        def item_for(host):
+            for index in range(window.tree.topLevelItemCount()):
+                group = window.tree.topLevelItem(index)
+                for child_index in range(group.childCount()):
+                    child = group.child(child_index)
+                    if child.data(0, Qt.ItemDataRole.UserRole) == host:
+                        return child
+            raise AssertionError(host)
+
+        germany = next(
+            window.tree.topLevelItem(i)
+            for i in range(window.tree.topLevelItemCount())
+            if window.tree.topLevelItem(i).text(0) == "Germany"
+        )
+        # Selecting a group selects every endpoint inside it.
+        germany.setSelected(True)
+        cities = [s.city for s in window._selected_servers()]
+        self.assertEqual(sorted(cities), ["Berlin", "Frankfurt"])
+        # Deselecting the group deselects the endpoints again.
+        germany.setSelected(False)
+        self.assertEqual(window._selected_servers(), [])
+
+        # Endpoints are tested in the order they were selected, not list order.
+        frankfurt = item_for("fra.speed.invalid:8080")
+        berlin = item_for("ber.speed.invalid:8080")
+        frankfurt.setSelected(True)
+        berlin.setSelected(True)
+        self.assertEqual([s.city for s in window._selected_servers()], ["Frankfurt", "Berlin"])
+
+        # Re-sorting / re-grouping keeps both the selection and its order.
+        window.combo_sort.setCurrentText("name")
+        self.assertEqual([s.city for s in window._selected_servers()], ["Frankfurt", "Berlin"])
+
+        # A search hides one endpoint but does not forget it, or its position.
+        window.search.setText("Berlin")
+        self.assertEqual([s.city for s in window._selected_servers()], ["Berlin"])
+        window.search.clear()
+        self.assertEqual([s.city for s in window._selected_servers()], ["Frankfurt", "Berlin"])
+
+    def test_auto_engine_falls_back_and_remembers(self):
+        from unittest.mock import Mock, patch
+
+        from speedchecker.gui import TestWorker
+        from speedchecker.models import CheckerError, Measurement
+
+        window = MainWindow()
+        worker = TestWorker("single", window._payload([]))
+        worker.payload["backend"] = "auto"
+        ookla, builtin = Mock(), Mock()
+        ookla.measure.side_effect = CheckerError("speedtest exited with code 2: Cannot write")
+        builtin.measure.return_value = Measurement(1.0, 2.0, 3.0, "h", "l")
+        with (
+            patch("speedchecker.gui.bundled_speedtest_binary", return_value="speedtest"),
+            patch("speedchecker.gui.OoklaSpeedtest", return_value=ookla),
+            patch.object(worker, "_builtin_engine", return_value=builtin),
+        ):
+            engine = worker._engine(None)
+            self.assertEqual(engine.measure().download_mbps, 1.0)
+            self.assertTrue(worker._prefer_builtin)
+            # Later servers in the same run go straight to the built-in engine.
+            self.assertIs(worker._engine(None), builtin)
+            self.assertEqual(ookla.measure.call_count, 1)
+
+    def test_download_reports_progress_and_result(self):
+        from unittest.mock import patch
+
+        from speedchecker.gui import TestWorker
+
+        window = MainWindow()
+        worker = TestWorker("download", window._payload([]))
+        seen, done, failed = [], [], []
+        worker.download_progress.connect(lambda d, t: seen.append((d, t)))
+        worker.downloaded.connect(done.append)
+        worker.failed.connect(failed.append)
+
+        def fake_download(log=lambda message: None, *, destination=None, progress=None):
+            progress(10, 20)
+            progress(20, 20)
+            return "/tmp/fake-speedtest"
+
+        with patch("speedchecker.gui.download_ookla", side_effect=fake_download):
+            worker.run()
+        self.assertEqual(seen, [(10, 20), (20, 20)])
+        self.assertEqual(done, ["/tmp/fake-speedtest"])
+        self.assertEqual(failed, [])
+
+    def test_download_failure_is_reported(self):
+        from unittest.mock import patch
+
+        from speedchecker.gui import TestWorker
+        from speedchecker.models import CheckerError
+
+        window = MainWindow()
+        worker = TestWorker("download", window._payload([]))
+        failed = []
+        worker.failed.connect(failed.append)
+        with patch("speedchecker.gui.download_ookla", side_effect=CheckerError("boom")):
+            worker.run()
+        self.assertEqual(failed, ["boom"])
+
     def test_gauge_value_and_scale(self):
         gauge = GaugeWidget("Download")
         gauge.set_value(250)

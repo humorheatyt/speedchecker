@@ -33,12 +33,12 @@ is picked up automatically — still no system-wide install.
 
 - **Home** — two separate speedometer gauges (download / upload), live
   instantaneous speed, live chart, latency & server readout, start/stop.
-- **Locations** — fetches every region returned by `expressvpnctl get regions` (not Ookla servers). Ctrl-click to multi-select; selecting a group includes every endpoint; batch tests all displayed locations. The location is used to connect the VPN, while a separate Ookla test server measures throughput. Requires an activated ExpressVPN client and `expressvpnctl` in PATH for real tests.
+- **Locations** — fetches every region returned by `expressvpnctl get regions` (not Ookla servers). Ctrl-click to multi-select; selecting a group (e.g. a country) selects every endpoint inside it and Ctrl-clicking the group toggles them all. Tests run in the exact order you selected the endpoints, and the selection survives re-sorting, re-grouping and search filtering. Batch test uses the selection when there is one, otherwise every displayed location. The location is used to connect the VPN, while a separate Ookla test server measures throughput. Requires an activated ExpressVPN client and `expressvpnctl` in PATH for real tests.
 - **Settings** — language EN/FA, speed unit (Mbps, Gbps, Kbps, bps, MB/s,
   GB/s, KB/s, MiB/s, KiB/s), repetitions per test, **connection / command /
-  per-test timeouts**, phase duration, parallel connections, serial repeats,
-  engine (Auto / Built-in / Ookla / Demo), Ookla license acceptance, and
-  ExpressVPN connection (on by default), optional one-time direct baseline before VPN tests, and explicit permission to disconnect an existing tunnel. An already-connected VPN otherwise blocks the run.
+  per-test timeouts**, phase duration, parallel connections (built-in
+  engine), engine (Auto / Built-in / Ookla / Demo), Ookla license acceptance, and
+  ExpressVPN connection (on by default), optional one-time direct baseline before VPN tests, and explicit permission to disconnect an existing tunnel. An already-connected VPN otherwise blocks the run. The Ookla download button reports live progress and confirms the saved file; Auto mode retries a transient Ookla failure once and then falls back to the built-in engine.
 - **History** — every test/connection (success *and* errors) is saved to
   `~/.speedchecker/history.json`; filter by status (errors only / success
   only), text, minimum download or maximum latency; export or clear.

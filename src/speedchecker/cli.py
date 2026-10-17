@@ -12,6 +12,7 @@ from .backends import (
     DemoSpeedtest,
     DemoVPN,
     ExpressVPN,
+    FallbackSpeedtest,
     OoklaSpeedtest,
     bundled_speedtest_binary,
     check_dependencies,
@@ -131,7 +132,16 @@ def main(argv: list[str] | None = None) -> int:
                 speedtest = OoklaSpeedtest(
                     timeout=args.speedtest_timeout,
                     accept_license=args.accept_license,
+                    log=print,
                 )
+                if args.engine == "auto":
+                    # Keep "auto" truly automatic: a transient Ookla failure
+                    # must not abort the whole run when the bundled engine works.
+                    speedtest = FallbackSpeedtest(
+                        speedtest,
+                        lambda: BuiltinSpeedtest(timeout=args.speedtest_timeout, log=print),
+                        log=print,
+                    )
             else:
                 print(
                     "Using the built-in speed engine bundled with this project "

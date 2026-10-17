@@ -1,11 +1,91 @@
 """External CLIs are invoked without a shell, with bounded command/state waits."""
 
+import json
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from .models import CheckerError, Measurement
+
+# Ookla's own service occasionally drops the transfer stream ("Cannot write")
+# or answers its configuration request with a 5xx.  Those failures are worth
+# one automatic retry; configuration/license errors are not.
+_TRANSIENT_MARKERS = (
+    "cannot write",
+    "cannot retrieve configuration",
+    "cannot open",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "temporarily unavailable",
+    "try again",
+    "502",
+    "503",
+    "504",
+)
+
+_HINTS = (
+    (
+        "cannot write",
+        "the upload/data stream was interrupted — retry; if it keeps happening "
+        "check the VPN, firewall/antivirus, or MTU, or keep the built-in engine",
+    ),
+    (
+        "cannot retrieve configuration",
+        "Ookla's configuration service could not be reached — check the internet "
+        "connection or VPN and retry",
+    ),
+    (
+        "timed out",
+        "raise the speed-test timeout in Settings and retry",
+    ),
+    (
+        "cannot run",
+        "the speedtest executable could not be started — check antivirus/permissions",
+    ),
+)
+
+
+def _json_error(output: str) -> str | None:
+    """Return Ookla's ``{"error": "..."}`` message when output is JSON."""
+    for line in reversed((output or "").strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("error"), str):
+            message = data["error"].strip().rstrip(":").strip()
+            if message:
+                return message
+    return None
+
+
+def _failure_detail(stderr: str, stdout: str) -> str:
+    for output in (stderr, stdout):
+        message = _json_error(output)
+        if message is not None:
+            return message
+    return (stderr or stdout or "").strip()[-2000:]
+
+
+def _is_transient(error: Exception) -> bool:
+    message = str(error).casefold()
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
+def _with_hint(error: CheckerError) -> CheckerError:
+    """Append an actionable hint to a known Ookla failure."""
+    message = str(error)
+    lowered = message.casefold()
+    for marker, hint in _HINTS:
+        if marker in lowered:
+            return CheckerError(f"{message}\nHint: {hint}.")
+    return error
 
 
 def bundled_speedtest_binary() -> Path | None:
@@ -40,8 +120,9 @@ class CommandRunner:
         except OSError as exc:
             raise CheckerError(f"Cannot run {args[0]}: {exc}") from exc
         if result.returncode:
-            detail = (result.stderr or result.stdout).strip()[-2000:]
-            raise CheckerError(f"{args[0]} exited with code {result.returncode}: {detail}")
+            detail = _failure_detail(result.stderr, result.stdout)
+            message = f"{args[0]} exited with code {result.returncode}"
+            raise CheckerError(f"{message}: {detail}" if detail else message)
         return result.stdout
 
 
@@ -97,11 +178,49 @@ class ExpressVPN:
 
 
 class OoklaSpeedtest:
-    def __init__(self, runner=None, timeout=180.0, accept_license=False, server_id: str = ""):
+    """Official Ookla CLI, with one bounded retry for transient failures.
+
+    ``attempts`` covers failures such as Ookla's ``{"error": "Cannot write: "}``
+    (the transfer stream was interrupted) or a temporary 5xx from its
+    configuration service.  Permanent errors (license, missing binary) are
+    raised immediately, with an actionable hint.
+    """
+
+    def __init__(
+        self,
+        runner=None,
+        timeout=180.0,
+        accept_license=False,
+        server_id: str = "",
+        *,
+        log=lambda message: None,
+        attempts: int = 2,
+        retry_delay: float = 1.5,
+        cancel: threading.Event | None = None,
+    ):
         self.runner = runner or CommandRunner()
         self.timeout = timeout
         self.accept_license = accept_license
         self.server_id = server_id
+        self.log = log
+        self.attempts = max(1, int(attempts))
+        self.retry_delay = max(0.0, float(retry_delay))
+        self.cancel = cancel
+
+    def _args(self, binary: Path) -> list[str]:
+        args = [str(binary), "--format=json", "--progress=no"]
+        if self.server_id:
+            args.append(f"--server-id={self.server_id}")
+        if self.accept_license:
+            args.extend(["--accept-license", "--accept-gdpr"])
+        return args
+
+    def _wait_before_retry(self) -> None:
+        if self.cancel is not None:
+            if self.cancel.wait(self.retry_delay):
+                raise CheckerError("Test cancelled by user.")
+        elif self.retry_delay:
+            time.sleep(self.retry_delay)
 
     def measure(self) -> Measurement:
         binary = bundled_speedtest_binary()
@@ -110,12 +229,47 @@ class OoklaSpeedtest:
                 "No Ookla speedtest binary found. Put it in vendor/ (see vendor/README.md), "
                 "add it to PATH, or use the built-in engine."
             )
-        args = [str(binary), "--format=json", "--progress=no"]
-        if self.server_id:
-            args.append(f"--server-id={self.server_id}")
-        if self.accept_license:
-            args.extend(["--accept-license", "--accept-gdpr"])
-        return Measurement.from_json(self.runner.run(args, self.timeout))
+        args = self._args(binary)
+        error: CheckerError | None = None
+        for attempt in range(1, self.attempts + 1):
+            if self.cancel is not None and self.cancel.is_set():
+                raise CheckerError("Test cancelled by user.")
+            try:
+                return Measurement.from_json(self.runner.run(args, self.timeout))
+            except CheckerError as exc:
+                error = exc
+                if attempt >= self.attempts or not _is_transient(exc):
+                    raise _with_hint(exc) from exc
+                self.log(f"Ookla attempt {attempt}/{self.attempts} failed ({exc}) — retrying…")
+                self._wait_before_retry()
+        raise _with_hint(error)  # pragma: no cover - the loop always returns or raises
+
+
+class FallbackSpeedtest:
+    """Try the primary engine, then keep using the fallback for later tests.
+
+    Used by engine mode ``auto``: a transient Ookla failure should not lose the
+    measurement when the built-in pure-Python engine can still provide one.
+    """
+
+    def __init__(self, primary, fallback_factory, log=lambda message: None, on_fallback=None):
+        self.primary = primary
+        self.fallback_factory = fallback_factory
+        self.log = log
+        self.on_fallback = on_fallback or (lambda: None)
+        self._fallback = None
+
+    def measure(self) -> Measurement:
+        if self._fallback is not None:
+            return self._fallback.measure()
+        try:
+            return self.primary.measure()
+        except CheckerError as exc:
+            reason = str(exc).replace("\n", " ")
+            self._fallback = self.fallback_factory()
+            self.on_fallback()
+            self.log(f"↻ Auto engine: Ookla failed ({reason}) — using the built-in engine.")
+            return self._fallback.measure()
 
 
 def check_dependencies(require_speedtest_binary: bool = False) -> None:

@@ -17,6 +17,7 @@ from speedchecker.servers import (
     demo_servers,
     group_servers,
     load_servers_file,
+    ordered_servers,
     sort_servers,
 )
 from speedchecker.units import SPEED_UNITS, convert_speed, format_size, format_speed
@@ -59,6 +60,15 @@ class ServerTests(unittest.TestCase):
         self.assertNotEqual([s.host for s in randomised], [s.host for s in shuffled])
         with self.assertRaises(CheckerError):
             sort_servers(shuffled, "bogus")
+
+    def test_selection_order_is_preserved(self):
+        chosen = [self.servers[3], self.servers[0], self.servers[2]]
+        self.assertEqual(ordered_servers([s.host for s in chosen], self.servers), chosen)
+        self.assertEqual(
+            ordered_servers(["missing", self.servers[1].host, self.servers[1].host], self.servers),
+            [self.servers[1]],
+        )
+        self.assertEqual(ordered_servers([], self.servers), [])
 
     def test_grouping_like_expressvpn(self):
         groups = group_servers(self.servers, "country")
@@ -240,12 +250,24 @@ class ExpressRegionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / "speedtest"
             class Response:
+                """Stream once, then EOF — like a real HTTP response body."""
+
+                def __init__(self):
+                    self._sent = False
+
                 def __enter__(self):
                     return self
+
                 def __exit__(self, *_):
                     pass
+
                 def read(self, _):
+                    if self._sent:
+                        return b""
+                    self._sent = True
                     return archive.getvalue()
+
+            seen = []
             with (
                 patch("speedchecker.ookla_download.platform.system", return_value="Linux"),
                 patch("speedchecker.ookla_download.platform.machine", return_value="x86_64"),
@@ -254,5 +276,12 @@ class ExpressRegionTests(unittest.TestCase):
                     return_value=Response(),
                 ),
             ):
-                self.assertEqual(download_ookla(destination=target), target)
+                self.assertEqual(
+                    download_ookla(
+                        destination=target,
+                        progress=lambda done, total: seen.append((done, total)),
+                    ),
+                    target,
+                )
             self.assertEqual(target.read_bytes(), b"fake executable")
+            self.assertEqual(seen[-1], (len(archive.getvalue()), 0))

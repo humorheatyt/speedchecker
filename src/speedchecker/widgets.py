@@ -1,11 +1,145 @@
-"""Custom painted widgets: speedometer gauge + live line chart."""
+"""Custom widgets: speedometer gauge, live line chart, and the location tree."""
 
 import math
 from collections import deque
 
 from PyQt6.QtCore import QRectF, Qt
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QWidget
+
+
+class ServerTree(QTreeWidget):
+    """Location tree with ordered, group-aware selection.
+
+    * Selecting a group header (country/sponsor/letter) selects every endpoint
+      inside it, and Ctrl-clicking it toggles the whole group.
+    * :meth:`selected_hosts` returns endpoints in the exact order they were
+      selected — that is the order tests are run in.
+    * A selection survives rebuilding the tree (sort/group/search), including
+      endpoints that are temporarily hidden by the search filter.
+    """
+
+    HOST_ROLE = Qt.ItemDataRole.UserRole
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Selected endpoints in selection order, including ones hidden by a filter.
+        self._wanted: list[str] = []
+        self._selected_items: list[QTreeWidgetItem] = []
+        self._guard = False
+        self.itemSelectionChanged.connect(self._on_selection_changed)
+
+    # -- structure --------------------------------------------------------
+    def host_of(self, item: QTreeWidgetItem | None) -> str:
+        if item is None:
+            return ""
+        value = item.data(0, self.HOST_ROLE)
+        return value if isinstance(value, str) else ""
+
+    def is_group(self, item: QTreeWidgetItem | None) -> bool:
+        return item is not None and item.childCount() > 0 and not self.host_of(item)
+
+    def item_hosts(self, item: QTreeWidgetItem | None) -> list[str]:
+        if item is None:
+            return []
+        if self.is_group(item):
+            return [
+                host
+                for index in range(item.childCount())
+                if (host := self.host_of(item.child(index)))
+            ]
+        host = self.host_of(item)
+        return [host] if host else []
+
+    def _items_in_order(self):
+        for index in range(self.topLevelItemCount()):
+            top = self.topLevelItem(index)
+            yield top
+            for child_index in range(top.childCount()):
+                yield top.child(child_index)
+
+    def present_hosts(self) -> list[str]:
+        return [host for item in self._items_in_order() if (host := self.host_of(item))]
+
+    def _selected_host_set(self) -> set[str]:
+        return {host for item in self.selectedItems() for host in self.item_hosts(item)}
+
+    def _set_children(self, item: QTreeWidgetItem, selected: bool) -> None:
+        for index in range(item.childCount()):
+            item.child(index).setSelected(selected)
+
+    # -- public API -------------------------------------------------------
+    def selected_hosts(self) -> list[str]:
+        """Selected endpoints, in the order they were selected."""
+        present = set(self.present_hosts())
+        return [host for host in self._wanted if host in present]
+
+    def remember_selection(self, valid_hosts=None) -> list[str]:
+        """Selection to carry over a rebuild (hidden endpoints included)."""
+        wanted = list(dict.fromkeys(self._wanted))
+        if valid_hosts is not None:
+            wanted = [host for host in wanted if host in valid_hosts]
+        return wanted
+
+    def restore_selection(self, hosts) -> None:
+        """Select the given hosts in order; keep those not currently shown."""
+        self._wanted = list(dict.fromkeys(hosts))
+        visible = set(self.present_hosts())
+        selected = {host for host in self._wanted if host in visible}
+        self._guard = True
+        try:
+            for item in self._items_in_order():
+                host = self.host_of(item)
+                if host:
+                    item.setSelected(host in selected)
+            self._selected_items = [item for item in self._items_in_order() if item.isSelected()]
+        finally:
+            self._guard = False
+
+    # -- selection bookkeeping -------------------------------------------
+    def _on_selection_changed(self) -> None:
+        if self._guard:
+            return
+        self._guard = True
+        try:
+            # QTreeWidgetItem is not hashable in PyQt6 — track identity.
+            before = {id(item) for item in self._selected_items}
+            current = {id(item) for item in self.selectedItems()}
+            items = list(self._items_in_order())
+            added = [item for item in items if id(item) in current and id(item) not in before]
+            removed = [item for item in self._selected_items if id(item) not in current]
+            # A group header toggles its whole group.
+            for item in added:
+                if self.is_group(item):
+                    self._set_children(item, True)
+            for item in removed:
+                if self.is_group(item):
+                    keep = {id(child) for child in added}
+                    for index in range(item.childCount()):
+                        child = item.child(index)
+                        if id(child) not in keep:
+                            child.setSelected(False)
+            current = {id(item) for item in self.selectedItems()}
+            selected = self._selected_host_set()
+            present = set(self.present_hosts())
+            # Visible hosts that were deselected leave the order; hidden
+            # selections are not affected by clicks on visible items.
+            self._wanted = [
+                host for host in self._wanted if host not in present or host in selected
+            ]
+            for item in items:
+                if id(item) in current and id(item) not in before:
+                    for host in self.item_hosts(item):
+                        if host in selected and host not in self._wanted:
+                            self._wanted.append(host)
+            # Keyboard/programmatic changes (Ctrl+A, ranges) fall back to the
+            # visible list order for endpoints that were not seen above.
+            for host in self.present_hosts():
+                if host in selected and host not in self._wanted:
+                    self._wanted.append(host)
+            self._selected_items = [item for item in items if id(item) in current]
+        finally:
+            self._guard = False
 
 
 class GaugeWidget(QWidget):

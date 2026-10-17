@@ -35,13 +35,18 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .backends import DemoVPN, ExpressVPN, OoklaSpeedtest, bundled_speedtest_binary
+from .backends import (
+    DemoVPN,
+    ExpressVPN,
+    FallbackSpeedtest,
+    OoklaSpeedtest,
+    bundled_speedtest_binary,
+)
 from .engine import BuiltinSpeedtest, DemoSpeedtestLive
 from .history import HistoryStore, filter_history
 from .i18n import is_rtl, tr
@@ -53,10 +58,11 @@ from .servers import (
     express_region,
     group_servers,
     load_servers_file,
+    ordered_servers,
     sort_servers,
 )
 from .units import SPEED_DESCRIPTIONS, SPEED_UNITS, convert_speed, format_size
-from .widgets import GaugeWidget, LiveChart
+from .widgets import GaugeWidget, LiveChart, ServerTree
 
 STYLE = """
 QMainWindow, QWidget { background:#0f172a; color:#e2e8f0;
@@ -97,37 +103,24 @@ class TestWorker(QThread):
     progress = pyqtSignal(str, float, int)  # phase, live Mbps, bytes
     record = pyqtSignal(dict)  # one finished server record
     downloaded = pyqtSignal(str)
+    download_progress = pyqtSignal(int, int)  # bytes done, total (0 = unknown)
     fetched = pyqtSignal(list)  # VPN regions (list[dict])
+    failed = pyqtSignal(str)  # action failed (fetch/download); tests record per server
     busy = pyqtSignal(bool)
 
     def __init__(self, action: str, payload: dict, parent=None):
         super().__init__(parent)
         self.action, self.payload = action, payload
         self.cancel_event = threading.Event()
+        self._prefer_builtin = False  # set after an Ookla failure in auto mode
 
     # -- engine factory ---------------------------------------------------
-    def _engine(self, server: Server | None):
+    def _builtin_engine(self, server: Server | None):
         p = self.payload
 
         def emit(phase, mbps, done):
             self.progress.emit(phase, mbps, done)
 
-        if p["backend"] == "demo":
-            return DemoSpeedtestLive(
-                server,
-                duration=min(p["duration"], 4.0),
-                progress=emit,
-                log=self.log.emit,
-                cancel=self.cancel_event,
-            )
-        if p["backend"] == "ookla" or (p["backend"] == "auto" and bundled_speedtest_binary()):
-            self.log.emit(f"Engine: Ookla binary {bundled_speedtest_binary()}")
-            return OoklaSpeedtest(
-                timeout=p["test_timeout"],
-                accept_license=p["accept_license"],
-                server_id=server.id if server and server.id else "",
-            )
-        self.log.emit("Engine: built-in (bundled with the project, no external speedtest needed)")
         return BuiltinSpeedtest(
             server,
             timeout=p["test_timeout"],
@@ -137,6 +130,50 @@ class TestWorker(QThread):
             log=self.log.emit,
             cancel=self.cancel_event,
         )
+
+    def _engine(self, server: Server | None):
+        p = self.payload
+        if p["backend"] == "demo":
+            return DemoSpeedtestLive(
+                server,
+                duration=min(p["duration"], 4.0),
+                progress=lambda phase, mbps, done: self.progress.emit(phase, mbps, done),
+                log=self.log.emit,
+                cancel=self.cancel_event,
+            )
+        binary = bundled_speedtest_binary()
+        use_ookla = p["backend"] == "ookla" or (
+            p["backend"] == "auto" and binary and not self._prefer_builtin
+        )
+        if use_ookla:
+            self.log.emit(f"Engine: Ookla binary {binary or 'from PATH'}")
+            engine = OoklaSpeedtest(
+                timeout=p["test_timeout"],
+                accept_license=p["accept_license"],
+                server_id=server.id if server and server.id else "",
+                log=self.log.emit,
+                cancel=self.cancel_event,
+            )
+            if p["backend"] == "auto":
+                # "Auto" only stays automatic if a failed Ookla run can fall
+                # back to the bundled engine instead of losing the result.
+                return FallbackSpeedtest(
+                    engine,
+                    lambda: self._builtin_engine(server),
+                    log=self.log.emit,
+                    on_fallback=self._use_builtin_after_ookla_failure,
+                )
+            return engine
+        if p["backend"] == "auto" and self._prefer_builtin:
+            self.log.emit("Engine: built-in (Ookla fallback from earlier in this run)")
+        else:
+            self.log.emit(
+                "Engine: built-in (bundled with the project, no external speedtest needed)"
+            )
+        return self._builtin_engine(server)
+
+    def _use_builtin_after_ookla_failure(self):
+        self._prefer_builtin = True
 
     def _vpn(self, regions_servers):
         p = self.payload
@@ -170,15 +207,17 @@ class TestWorker(QThread):
                 connected = True  # connect may establish a tunnel before raising
                 elapsed = vpn.connect(region)
                 self.log.emit(f"VPN: connected in {elapsed:.2f}s")
+            # VPN region IDs are not Ookla IDs/hosts. A custom speed-test
+            # endpoint, however, must keep its explicit server selection.
+            target = server if p["backend"] == "demo" or server.id or server.url else None
+            # One engine per server so an "auto" fallback also covers repeats.
+            engine = self._engine(target)
             samples = []
             for i in range(p["repeat"]):
                 if self.cancel_event.is_set():
                     raise CheckerError("Test cancelled by user.")
                 self.log.emit(f"— {server.label} ({server.host}) test {i + 1}/{p['repeat']} —")
-                # VPN region IDs are not Ookla IDs/hosts. A custom speed-test
-                # endpoint, however, must keep its explicit server selection.
-                target = server if p["backend"] == "demo" or server.id or server.url else None
-                samples.append(self._engine(target).measure())
+                samples.append(engine.measure())
             record.update(
                 download_mbps=round(fmean(s.download_mbps for s in samples), 3),
                 upload_mbps=round(fmean(s.upload_mbps for s in samples), 3),
@@ -214,7 +253,14 @@ class TestWorker(QThread):
                     servers = [express_region(r) for r in regions]
                 self.fetched.emit([s.to_dict() for s in servers])
             elif self.action == "download":
-                self.downloaded.emit(str(download_ookla(self.log.emit)))
+                self.downloaded.emit(
+                    str(
+                        download_ookla(
+                            self.log.emit,
+                            progress=lambda done, total: self.download_progress.emit(done, total),
+                        )
+                    )
+                )
             elif self.action in ("single", "batch"):
                 servers = [Server.from_dict(d) for d in self.payload["servers"]]
                 vpn = self._vpn(servers)
@@ -254,6 +300,7 @@ class TestWorker(QThread):
                 raise CheckerError(f"Unknown action {self.action}")
         except Exception as exc:
             self.log.emit(f"✗ {exc}")
+            self.failed.emit(str(exc))
         finally:
             self.busy.emit(False)
 
@@ -274,6 +321,9 @@ class MainWindow(QMainWindow):
         self.servers: list[Server] = []
         self.history = HistoryStore()
         self.worker: TestWorker | None = None
+        self._current_action = ""
+        self._downloading = False
+        self._download_logged = 0  # last logged download milestone (25 %)
         self._build_ui()
         self._refresh_history()
         self.log_line(
@@ -369,7 +419,7 @@ class MainWindow(QMainWindow):
         self.hint = QLabel()
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
-        self.tree = QTreeWidget()
+        self.tree = ServerTree()
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setColumnCount(5)
         for column, width in enumerate((280, 180, 320, 110, 110)):
@@ -452,7 +502,6 @@ class MainWindow(QMainWindow):
         self.spin_test_to = QDoubleSpinBox(minimum=1, maximum=3600, value=180)
         self.spin_duration = QDoubleSpinBox(minimum=1, maximum=300, value=10)
         self.spin_conns = QSpinBox(minimum=1, maximum=16, value=4)
-        self.chk_serial = QCheckBox()
         self.chk_accept = QCheckBox()
         self.chk_vpn = QCheckBox()
         self.chk_vpn.setChecked(True)
@@ -462,6 +511,16 @@ class MainWindow(QMainWindow):
         self.btn_download.clicked.connect(self._download_ookla)
         self.btn_ookla_page = QPushButton(objectName="secondary")
         self.btn_ookla_page.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(OFFICIAL_PAGE)))
+        # Live feedback for the Ookla CLI download (Settings tab).
+        self.download_bar = QProgressBar()
+        self.download_bar.setVisible(False)
+        self.download_status = QLabel()
+        self.download_status.setWordWrap(True)
+        self.download_panel = QWidget()
+        download_layout = QHBoxLayout(self.download_panel)
+        download_layout.setContentsMargins(0, 0, 0, 0)
+        download_layout.addWidget(self.download_status, 1)
+        download_layout.addWidget(self.download_bar)
         self._form_rows = [
             ("language", self.combo_lang),
             ("unit", self.combo_unit),
@@ -472,12 +531,12 @@ class MainWindow(QMainWindow):
             ("timeout_test", self.spin_test_to),
             ("duration", self.spin_duration),
             ("connections", self.spin_conns),
-            ("serial", self.chk_serial),
             ("accept_license", self.chk_accept),
             ("vpn_mode", self.chk_vpn),
             ("disconnect_existing", self.chk_disconnect),
             ("baseline", self.chk_baseline),
             ("download_ookla", self.btn_download),
+            ("download_status", self.download_panel),
             ("ookla_page", self.btn_ookla_page),
         ]
         for _, widget in self._form_rows:
@@ -533,6 +592,8 @@ class MainWindow(QMainWindow):
         self.btn_export.setText(t("export"))
         self.btn_clear_log.setText(t("clear_log"))
         self.btn_save_log.setText(t("save_log"))
+        self.btn_download.setText(t("download_button"))
+        self.btn_ookla_page.setText(t("ookla_page_button"))
         self.htext.setPlaceholderText(t("filter_text"))
         backend_labels = {
             "auto": t("backend_auto"),
@@ -558,12 +619,12 @@ class MainWindow(QMainWindow):
             "timeout_test": t("timeout_test"),
             "duration": t("duration"),
             "connections": t("connections"),
-            "serial": t("serial"),
             "accept_license": t("accept_license"),
             "vpn_mode": t("vpn_mode"),
             "disconnect_existing": t("disconnect_existing"),
             "baseline": t("baseline"),
             "download_ookla": t("download_ookla"),
+            "download_status": t("download_status"),
             "ookla_page": t("ookla_page"),
         }
         form = self._settings_tab_layout()
@@ -571,7 +632,37 @@ class MainWindow(QMainWindow):
             item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
             if item and item.widget():
                 item.widget().setText(labels[key])
+        self._retranslate_tooltips()
+        if not self._downloading:
+            self._show_ookla_status()
         self._unit_changed(self.combo_unit.currentText())
+
+    def _retranslate_tooltips(self):
+        t = lambda key: tr(self.lang, key)  # noqa: E731 - tiny local helper
+        self.combo_backend.setToolTip(t("tip_backend"))
+        self.spin_repeat.setToolTip(t("tip_repeat"))
+        self.spin_conn_to.setToolTip(t("tip_timeout_conn"))
+        self.spin_cmd_to.setToolTip(t("tip_timeout_cmd"))
+        self.spin_test_to.setToolTip(t("tip_timeout_test"))
+        self.spin_duration.setToolTip(t("tip_duration"))
+        self.spin_conns.setToolTip(t("tip_connections"))
+        self.chk_accept.setToolTip(t("tip_accept_license"))
+        self.chk_vpn.setToolTip(t("tip_vpn_mode"))
+        self.chk_disconnect.setToolTip(t("tip_disconnect_existing"))
+        self.chk_baseline.setToolTip(t("tip_baseline"))
+
+    def _show_ookla_status(self):
+        """Show whether the official binary exists, and where."""
+        binary = bundled_speedtest_binary()
+        if binary is None:
+            self.download_status.setText(tr(self.lang, "ookla_missing"))
+            return
+        try:
+            size = format_size(binary.stat().st_size)
+        except OSError:
+            size = "—"
+        self.download_status.setText(tr(self.lang, "ookla_ready").format(path=binary, size=size))
+        self.btn_download.setText(tr(self.lang, "redownload_ookla"))
 
     def _settings_tab_layout(self) -> QFormLayout:
         return self.tabs.widget(4).layout()
@@ -604,12 +695,15 @@ class MainWindow(QMainWindow):
         }
 
     def _run_worker(self, action: str, payload: dict):
+        self._current_action = action
         self.worker = TestWorker(action, payload, self)
         self.worker.log.connect(self.log_line)
         self.worker.progress.connect(self._on_progress)
         self.worker.record.connect(self._on_record)
         self.worker.fetched.connect(self._on_fetched)
         self.worker.downloaded.connect(self._on_downloaded)
+        self.worker.download_progress.connect(self._on_download_progress)
+        self.worker.failed.connect(self._on_failed)
         self.worker.busy.connect(self._on_busy)
         self.worker.start()
 
@@ -621,11 +715,74 @@ class MainWindow(QMainWindow):
         if not self.chk_accept.isChecked():
             QMessageBox.warning(self, "Ookla", tr(self.lang, "accept_first"))
             return
+        self._downloading = True
+        self._download_logged = 0
+        self.download_bar.setVisible(True)
+        self.download_bar.setRange(0, 0)  # size unknown until headers arrive
+        self.download_bar.setValue(0)
+        self.download_status.setText(tr(self.lang, "download_start"))
+        self.log_line(tr(self.lang, "download_start"))
         self._run_worker("download", self._payload([]))
 
+    def _on_download_progress(self, done: int, total: int):
+        if total > 0:
+            percent = min(100, int(done * 100 / total))
+            self.download_bar.setRange(0, 100)
+            self.download_bar.setValue(percent)
+            self.download_status.setText(
+                tr(self.lang, "download_progress").format(
+                    percent=percent,
+                    done=format_size(done),
+                    total=format_size(total),
+                )
+            )
+        else:
+            percent = 0
+            self.download_status.setText(
+                tr(self.lang, "download_progress_unknown").format(done=format_size(done))
+            )
+        if percent >= self._download_logged + 25:
+            self._download_logged = percent
+            self.log_line(
+                tr(self.lang, "download_progress").format(
+                    percent=percent,
+                    done=format_size(done),
+                    total=format_size(total) if total else "?",
+                )
+            )
+
     def _on_downloaded(self, path: str):
-        self.log_line(f"Ookla CLI ready: {path}")
-        self.combo_backend.setCurrentIndex(self.combo_backend.findData("ookla"))
+        self._downloading = False
+        self.download_bar.setVisible(False)
+        self.download_bar.setRange(0, 100)
+        self.download_bar.setValue(100)
+        try:
+            size = format_size(Path(path).stat().st_size)
+        except OSError:
+            size = "—"
+        self.download_status.setText(tr(self.lang, "ookla_ready").format(path=path, size=size))
+        self.btn_download.setText(tr(self.lang, "redownload_ookla"))
+        self.log_line(f"✓ Ookla CLI downloaded ({size}): {path}")
+        index = self.combo_backend.findData("ookla")
+        if index >= 0:
+            self.combo_backend.setCurrentIndex(index)
+        QMessageBox.information(
+            self,
+            tr(self.lang, "download_done_title"),
+            tr(self.lang, "download_done").format(path=path, size=size),
+        )
+
+    def _on_failed(self, message: str):
+        if self._current_action != "download":
+            return
+        self._downloading = False
+        self.download_bar.setVisible(False)
+        self.download_status.setText(tr(self.lang, "download_failed_status"))
+        QMessageBox.critical(
+            self,
+            tr(self.lang, "download_failed_title"),
+            message,
+        )
 
     def load_file(self):
         path, _ = QFileDialog.getOpenFileName(self, tr(self.lang, "load_file"), "", "JSON (*.json)")
@@ -655,38 +812,40 @@ class MainWindow(QMainWindow):
         return sort_servers(servers, self.combo_sort.currentText())
 
     def refresh_server_tree(self):
-        self.tree.clear()
-        servers = self._displayed_servers()
-        groups = group_servers(servers, self.combo_group.currentText())
-        for group, members in groups.items():
-            parent = QTreeWidgetItem(self.tree, [group or "—", "", "", "", ""]) if group else None
-            root = parent if parent else self.tree.invisibleRootItem()
-            for s in members:
-                item = QTreeWidgetItem(
-                    root,
-                    [
-                        s.label,
-                        s.sponsor,
-                        s.host,
-                        f"{s.distance_km:.0f} km" if s.distance_km is not None else "—",
-                        f"{s.latency_ms:.0f} ms" if s.latency_ms is not None else "—",
-                    ],
+        # The tree owns the selection order; rebuilding it (sort/group/search)
+        # must not lose what the user selected, even if the filter hides it.
+        remembered = self.tree.remember_selection({s.host for s in self.servers})
+        self.tree.blockSignals(True)
+        try:
+            self.tree.clear()
+            servers = self._displayed_servers()
+            groups = group_servers(servers, self.combo_group.currentText())
+            for group, members in groups.items():
+                parent = (
+                    QTreeWidgetItem(self.tree, [group or "—", "", "", "", ""]) if group else None
                 )
-                item.setData(0, Qt.ItemDataRole.UserRole, s.host)
-            if parent:
-                parent.setExpanded(True)
+                root = parent if parent else self.tree.invisibleRootItem()
+                for s in members:
+                    item = QTreeWidgetItem(
+                        root,
+                        [
+                            s.label,
+                            s.sponsor,
+                            s.host,
+                            f"{s.distance_km:.0f} km" if s.distance_km is not None else "—",
+                            f"{s.latency_ms:.0f} ms" if s.latency_ms is not None else "—",
+                        ],
+                    )
+                    item.setData(0, Qt.ItemDataRole.UserRole, s.host)
+                if parent:
+                    parent.setExpanded(True)
+            self.tree.restore_selection(remembered)
+        finally:
+            self.tree.blockSignals(False)
 
     def _selected_servers(self) -> list[Server]:
-        hosts = []
-        for item in self.tree.selectedItems():
-            host = item.data(0, Qt.ItemDataRole.UserRole)
-            if host:
-                hosts.append(host)
-            else:  # group selected → all its children
-                for i in range(item.childCount()):
-                    hosts.append(item.child(i).data(0, Qt.ItemDataRole.UserRole))
-        by_host = {s.host: s for s in self.servers}
-        return [by_host[h] for h in dict.fromkeys(hosts) if h in by_host]
+        """Selected endpoints in the order they were selected."""
+        return ordered_servers(self.tree.selected_hosts(), self.servers)
 
     # -------------------------------------------------------------- testing
     def start_tests(self, batch: bool):
@@ -694,7 +853,10 @@ class MainWindow(QMainWindow):
             self.servers = demo_servers()
             self.refresh_server_tree()
             self.log_line("Demo mode: loaded the offline simulated server list.")
-        servers = self._displayed_servers() if batch else self._selected_servers()
+        selected = self._selected_servers()
+        # Batch tests follow the selection order when something is selected;
+        # otherwise they run over the whole visible list.
+        servers = (selected or self._displayed_servers()) if batch else selected
         if not servers:
             if not batch and self.servers:
                 servers = self._displayed_servers()[:1]
