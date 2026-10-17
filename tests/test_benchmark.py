@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from vpnchecker.backends import DemoSpeedtest, DemoVPN
-from vpnchecker.benchmark import benchmark, run_batch
-from vpnchecker.models import CheckerError, Location, Measurement
-from vpnchecker.storage import ReportStore
+from speedchecker.backends import DemoSpeedtest, DemoVPN
+from speedchecker.benchmark import benchmark, run_batch
+from speedchecker.models import CheckerError, Location, Measurement
+from speedchecker.storage import ReportStore
 
 SAMPLE = Measurement(100.5, 40.75, 10.25, "demo.invalid", "Test")
 
@@ -66,7 +66,7 @@ class StorageTests(unittest.TestCase):
             store = ReportStore(path)
             store.reserve()
             store.save({"old": True})
-            with patch("vpnchecker.storage.os.replace", side_effect=OSError("denied")):
+            with patch("speedchecker.storage.os.replace", side_effect=OSError("denied")):
                 with self.assertRaises(CheckerError):
                     store.save({"new": True})
             self.assertEqual(json.loads(path.read_text()), {"old": True})

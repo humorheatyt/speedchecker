@@ -1,0 +1,751 @@
+"""SpeedChecker PyQt6 GUI — modern, bilingual (EN/FA), fully live.
+
+Run it with ``python app.py`` (project root) or ``speedchecker-gui``.
+Everything is here: full server catalogue with ExpressVPN-style grouping,
+single/batch tests, repeat count, timeouts, unit selection, live gauges +
+chart, history with filters, and a live log of everything that happens.
+"""
+
+import json
+import sys
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import fmean
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .backends import DemoVPN, ExpressVPN, OoklaSpeedtest, bundled_speedtest_binary
+from .engine import BuiltinSpeedtest, DemoSpeedtestLive
+from .history import HistoryStore, filter_history
+from .i18n import is_rtl, tr
+from .models import CheckerError, Location
+from .servers import (
+    Server,
+    demo_servers,
+    fetch_servers,
+    group_servers,
+    load_servers_file,
+    sort_servers,
+)
+from .units import SPEED_UNITS, convert_speed, format_size
+from .widgets import GaugeWidget, LiveChart
+
+STYLE = """
+QMainWindow, QWidget { background:#0f172a; color:#e2e8f0;
+  font-family:'Segoe UI',Tahoma,sans-serif; font-size:10pt; }
+QTabWidget::pane { border:1px solid #1e293b; border-radius:10px; }
+QTabBar::tab { background:#1e293b; padding:9px 18px; margin-right:3px;
+  border-top-left-radius:10px; border-top-right-radius:10px; }
+QTabBar::tab:selected { background:#0ea5e9; color:white;
+  font-weight:bold; }
+QPushButton { background:#0ea5e9; color:white; border:none;
+  border-radius:9px; padding:9px 16px; font-weight:bold; }
+QPushButton:hover { background:#38bdf8; }
+QPushButton:disabled { background:#334155; color:#94a3b8; }
+QPushButton#danger { background:#e11d48; }
+QPushButton#secondary { background:#334155; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTableWidget,
+QTreeWidget, QPlainTextEdit { background:#1e293b; border:1px solid #334155;
+  border-radius:8px; padding:6px; selection-background-color:#0ea5e9; }
+QGroupBox { border:1px solid #334155; border-radius:10px;
+  margin-top:12px; padding-top:14px; font-weight:bold; }
+QProgressBar { background:#1e293b; border-radius:8px; height:16px; text-align:center; }
+QProgressBar::chunk { background:#22c55e; border-radius:8px; }
+QHeaderView::section { background:#1e293b; padding:6px; border:none; font-weight:bold; }
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class TestWorker(QThread):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(str, float, int)  # phase, live Mbps, bytes
+    record = pyqtSignal(dict)  # one finished server record
+    fetched = pyqtSignal(list)  # server list (list[dict])
+    busy = pyqtSignal(bool)
+
+    def __init__(self, action: str, payload: dict, parent=None):
+        super().__init__(parent)
+        self.action, self.payload = action, payload
+        self.cancel_event = threading.Event()
+
+    # -- engine factory ---------------------------------------------------
+    def _engine(self, server: Server | None):
+        p = self.payload
+
+        def emit(phase, mbps, done):
+            self.progress.emit(phase, mbps, done)
+
+        if p["backend"] == "demo":
+            return DemoSpeedtestLive(
+                server,
+                duration=min(p["duration"], 4.0),
+                progress=emit,
+                log=self.log.emit,
+                cancel=self.cancel_event,
+            )
+        if p["backend"] == "ookla" or (p["backend"] == "auto" and bundled_speedtest_binary()):
+            self.log.emit(f"Engine: Ookla binary {bundled_speedtest_binary()}")
+            return OoklaSpeedtest(
+                timeout=p["test_timeout"],
+                accept_license=p["accept_license"],
+                server_id=server.id if server else "",
+            )
+        self.log.emit("Engine: built-in (bundled with the project, no external speedtest needed)")
+        return BuiltinSpeedtest(
+            server,
+            timeout=p["test_timeout"],
+            duration=p["duration"],
+            connections=p["connections"],
+            progress=emit,
+            log=self.log.emit,
+            cancel=self.cancel_event,
+        )
+
+    def _vpn(self, regions_servers):
+        p = self.payload
+        if not p["vpn_mode"]:
+            return None
+        if p["backend"] == "demo":
+            return DemoVPN([s.host for s in regions_servers])
+        return ExpressVPN(command_timeout=p["cmd_timeout"], connection_timeout=p["conn_timeout"])
+
+    def _measure_server(self, server: Server, vpn) -> dict:
+        p = self.payload
+        record = {
+            "time": _now(),
+            "server": server.host,
+            "location": server.label,
+            "sponsor": server.sponsor,
+            "status": "ok",
+            "error": "",
+            "mode": p["backend"],
+            "download_mbps": None,
+            "upload_mbps": None,
+            "latency_ms": None,
+            "repeat": p["repeat"],
+        }
+        try:
+            if vpn is not None:
+                regions = vpn.regions()
+                region = Location(server.country, server.city).find_region(regions) or server.host
+                self.log.emit(f"VPN: connecting to {region} …")
+                elapsed = vpn.connect(region)
+                self.log.emit(f"VPN: connected in {elapsed:.2f}s")
+            samples = []
+            for i in range(p["repeat"]):
+                if self.cancel_event.is_set():
+                    raise CheckerError("Test cancelled by user.")
+                self.log.emit(f"— {server.label} ({server.host}) test {i + 1}/{p['repeat']} —")
+                samples.append(self._engine(server).measure())
+            record.update(
+                download_mbps=round(fmean(s.download_mbps for s in samples), 3),
+                upload_mbps=round(fmean(s.upload_mbps for s in samples), 3),
+                latency_ms=round(fmean(s.latency_ms for s in samples), 2),
+                server=samples[-1].server,
+            )
+            self.log.emit(
+                f"✓ {server.label}: ↓{record['download_mbps']} Mbps "
+                f"↑{record['upload_mbps']} Mbps ping {record['latency_ms']} ms"
+            )
+        except Exception as exc:  # keep batch going; history keeps the error
+            record.update(status="error", error=str(exc))
+            self.log.emit(f"✗ {server.label}: {exc}")
+        finally:
+            if vpn is not None:
+                try:
+                    vpn.disconnect()
+                    self.log.emit("VPN: disconnected")
+                except Exception as exc:
+                    self.log.emit(f"VPN disconnect failed: {exc}")
+        return record
+
+    def run(self):  # noqa: C901 - one clear dispatch
+        self.busy.emit(True)
+        try:
+            if self.action == "fetch":
+                servers = (
+                    demo_servers()
+                    if self.payload["backend"] == "demo"
+                    else fetch_servers(timeout=self.payload["conn_timeout"], log=self.log.emit)
+                )
+                self.fetched.emit([s.to_dict() for s in servers])
+            elif self.action in ("single", "batch"):
+                servers = [Server.from_dict(d) for d in self.payload["servers"]]
+                vpn = self._vpn(servers)
+                for server in servers:
+                    if self.cancel_event.is_set():
+                        self.log.emit("Stopped by user.")
+                        break
+                    self.record.emit(self._measure_server(server, vpn))
+            else:
+                raise CheckerError(f"Unknown action {self.action}")
+        except Exception as exc:
+            self.log.emit(f"✗ {exc}")
+        finally:
+            self.busy.emit(False)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.lang = "en"
+        self.servers: list[Server] = []
+        self.history = HistoryStore()
+        self.worker: TestWorker | None = None
+        self._build_ui()
+        self._refresh_history()
+        self.log_line(
+            "SpeedChecker ready. Fetch the server list or load one from a JSON file "
+            "(Demo mode works fully offline)."
+        )
+        binary = bundled_speedtest_binary()
+        self.log_line(
+            f"Bundled Ookla binary: {binary or 'not present (built-in engine will be used)'}"
+        )
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        self.setWindowTitle(tr(self.lang, "app_title"))
+        self.resize(1240, 820)
+        self.setStyleSheet(STYLE)
+        tabs = QTabWidget()
+        self.tabs = tabs
+        tabs.addTab(self._home_tab(), "")
+        tabs.addTab(self._servers_tab(), "")
+        tabs.addTab(self._history_tab(), "")
+        tabs.addTab(self._logs_tab(), "")
+        tabs.addTab(self._settings_tab(), "")
+        self.setCentralWidget(tabs)
+        self._retranslate()
+
+    def _home_tab(self) -> QWidget:
+        w, layout = QWidget(), QVBoxLayout()
+        gauges = QHBoxLayout()
+        self.gauge_down, self.gauge_up = GaugeWidget(color="#22d3ee"), GaugeWidget(color="#a78bfa")
+        gauges.addWidget(self.gauge_down, 1)
+        gauges.addWidget(self.gauge_up, 1)
+        info = QVBoxLayout()
+        self.lbl_latency, self.lbl_server, self.lbl_live, self.lbl_status = (
+            QLabel("—") for _ in range(4)
+        )
+        for label in (self.lbl_latency, self.lbl_server, self.lbl_live, self.lbl_status):
+            label.setStyleSheet("font-size:12pt; padding:4px;")
+            info.addWidget(label)
+        info.addStretch(1)
+        gauges.addLayout(info, 1)
+        layout.addLayout(gauges)
+        self.chart = LiveChart()
+        layout.addWidget(self.chart)
+        self.progress_bar = QProgressBar()
+        layout.addWidget(self.progress_bar)
+        buttons = QHBoxLayout()
+        self.btn_start, self.btn_stop = QPushButton(), QPushButton()
+        self.btn_stop.setObjectName("danger")
+        self.btn_stop.setEnabled(False)
+        self.btn_start.clicked.connect(lambda: self.start_tests(batch=False))
+        self.btn_stop.clicked.connect(self.stop_tests)
+        buttons.addWidget(self.btn_start)
+        buttons.addWidget(self.btn_stop)
+        layout.addLayout(buttons)
+        w.setLayout(layout)
+        return w
+
+    def _servers_tab(self) -> QWidget:
+        w, layout = QWidget(), QVBoxLayout()
+        top = QHBoxLayout()
+        self.btn_fetch, self.btn_load = QPushButton(), QPushButton(objectName="secondary")
+        self.btn_test_sel, self.btn_batch = QPushButton(), QPushButton()
+        self.btn_fetch.clicked.connect(self.fetch_servers)
+        self.btn_load.clicked.connect(self.load_file)
+        self.btn_test_sel.clicked.connect(lambda: self.start_tests(batch=False))
+        self.btn_batch.clicked.connect(lambda: self.start_tests(batch=True))
+        for b in (self.btn_fetch, self.btn_load, self.btn_test_sel, self.btn_batch):
+            top.addWidget(b)
+        layout.addLayout(top)
+        filt = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.textChanged.connect(self.refresh_server_tree)
+        self.combo_group, self.combo_sort = QComboBox(), QComboBox()
+        self.combo_group.addItems(["none", "country", "sponsor", "letter"])
+        self.combo_sort.addItems(
+            ["file", "name", "country", "city", "sponsor", "host", "distance", "latency", "random"]
+        )
+        self.combo_group.setCurrentText("country")
+        self.combo_sort.setCurrentText("country")
+        for combo in (self.combo_group, self.combo_sort):
+            combo.currentTextChanged.connect(self.refresh_server_tree)
+        self.lbl_group, self.lbl_sort = QLabel(), QLabel()
+        for widget in (
+            self.search,
+            self.lbl_group,
+            self.combo_group,
+            self.lbl_sort,
+            self.combo_sort,
+        ):
+            filt.addWidget(widget)
+        layout.addLayout(filt)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        for column, width in enumerate((280, 180, 320, 110, 110)):
+            self.tree.setColumnWidth(column, width)
+        self.tree.header().setStretchLastSection(True)
+        self.tree.itemDoubleClicked.connect(lambda *_: self.start_tests(batch=False))
+        layout.addWidget(self.tree)
+        w.setLayout(layout)
+        return w
+
+    def _history_tab(self) -> QWidget:
+        w, layout = QWidget(), QVBoxLayout()
+        filt = QHBoxLayout()
+        self.combo_hstatus = QComboBox()
+        self.combo_hstatus.addItems(["all", "ok", "error"])
+        self.htext = QLineEdit()
+        self.hmin_down = QDoubleSpinBox(maximum=100000)
+        self.hmin_down.setSpecialValueText("—")
+        self.hmax_lat = QDoubleSpinBox(maximum=100000)
+        self.hmax_lat.setSpecialValueText("—")
+        self.btn_clear_hist, self.btn_export = QPushButton(), QPushButton(objectName="secondary")
+        for combo in (self.combo_hstatus,):
+            combo.currentTextChanged.connect(self._refresh_history)
+        self.htext.textChanged.connect(self._refresh_history)
+        self.hmin_down.valueChanged.connect(self._refresh_history)
+        self.hmax_lat.valueChanged.connect(self._refresh_history)
+        self.btn_clear_hist.clicked.connect(self._clear_history)
+        self.btn_export.clicked.connect(self._export_history)
+        for widget in (
+            self.combo_hstatus,
+            self.htext,
+            self.hmin_down,
+            self.hmax_lat,
+            self.btn_clear_hist,
+            self.btn_export,
+        ):
+            filt.addWidget(widget)
+        layout.addLayout(filt)
+        self.history_table = QTableWidget(0, 8)
+        layout.addWidget(self.history_table)
+        w.setLayout(layout)
+        return w
+
+    def _logs_tab(self) -> QWidget:
+        w, layout = QWidget(), QVBoxLayout()
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        layout.addWidget(self.log_view)
+        row = QHBoxLayout()
+        self.btn_clear_log, self.btn_save_log = (
+            QPushButton(objectName="secondary"),
+            QPushButton(objectName="secondary"),
+        )
+        self.btn_clear_log.clicked.connect(self.log_view.clear)
+        self.btn_save_log.clicked.connect(self._save_log)
+        row.addWidget(self.btn_clear_log)
+        row.addWidget(self.btn_save_log)
+        row.addStretch(1)
+        layout.addLayout(row)
+        w.setLayout(layout)
+        return w
+
+    def _settings_tab(self) -> QWidget:
+        w, form = QWidget(), QFormLayout()
+        self.combo_lang = QComboBox()
+        self.combo_lang.addItems(["en", "fa"])
+        self.combo_lang.currentTextChanged.connect(self._set_language)
+        self.combo_unit = QComboBox()
+        self.combo_unit.addItems(list(SPEED_UNITS))
+        self.combo_unit.currentTextChanged.connect(self._unit_changed)
+        self.combo_backend = QComboBox()
+        self.combo_backend.addItems(["auto", "builtin", "ookla", "demo"])
+        self.spin_repeat = QSpinBox(minimum=1, maximum=100, value=1)
+        self.spin_conn_to = QDoubleSpinBox(minimum=1, maximum=3600, value=60)
+        self.spin_cmd_to = QDoubleSpinBox(minimum=1, maximum=3600, value=30)
+        self.spin_test_to = QDoubleSpinBox(minimum=1, maximum=3600, value=180)
+        self.spin_duration = QDoubleSpinBox(minimum=1, maximum=300, value=10)
+        self.spin_conns = QSpinBox(minimum=1, maximum=16, value=4)
+        self.chk_serial = QCheckBox()
+        self.chk_accept = QCheckBox()
+        self.chk_vpn = QCheckBox()
+        self.chk_disconnect = QCheckBox()
+        self._form_rows = [
+            ("language", self.combo_lang),
+            ("unit", self.combo_unit),
+            ("backend", self.combo_backend),
+            ("repeat", self.spin_repeat),
+            ("timeout_conn", self.spin_conn_to),
+            ("timeout_cmd", self.spin_cmd_to),
+            ("timeout_test", self.spin_test_to),
+            ("duration", self.spin_duration),
+            ("connections", self.spin_conns),
+            ("serial", self.chk_serial),
+            ("accept_license", self.chk_accept),
+            ("vpn_mode", self.chk_vpn),
+            ("disconnect_existing", self.chk_disconnect),
+        ]
+        for _, widget in self._form_rows:
+            form.addRow(QLabel(), widget)
+        w.setLayout(form)
+        return w
+
+    # -------------------------------------------------------------- i18n
+    def _set_language(self, lang: str):
+        self.lang = lang
+        self.setLayoutDirection(
+            Qt.LayoutDirection.RightToLeft if is_rtl(lang) else Qt.LayoutDirection.LeftToRight
+        )
+        self._retranslate()
+
+    def _retranslate(self):
+        def t(key):
+            return tr(self.lang, key)
+
+        self.setWindowTitle(t("app_title"))
+        for i, key in enumerate(("home", "servers", "history", "logs", "settings")):
+            self.tabs.setTabText(i, t(key))
+        self.gauge_down.set_title(t("download"))
+        self.gauge_up.set_title(t("upload"))
+        self.btn_start.setText(t("start_test"))
+        self.btn_stop.setText(t("stop"))
+        self.btn_fetch.setText(t("fetch_servers"))
+        self.btn_load.setText(t("load_file"))
+        self.btn_test_sel.setText(t("test_selected"))
+        self.btn_batch.setText(t("batch_test"))
+        self.search.setPlaceholderText(t("search"))
+        self.lbl_group.setText(t("group_by"))
+        self.lbl_sort.setText(t("sort_by"))
+        self.hint.setText(t("group_servers_hint"))
+        self.tree.setHeaderLabels(
+            [t("location"), t("sponsor"), t("host"), t("distance"), t("latency")]
+        )
+        self.history_table.setHorizontalHeaderLabels(
+            [
+                t("time"),
+                t("location"),
+                t("jitter_server"),
+                t("download"),
+                t("upload"),
+                t("latency"),
+                t("status"),
+                t("error"),
+            ]
+        )
+        self.btn_clear_hist.setText(t("clear_history"))
+        self.btn_export.setText(t("export"))
+        self.btn_clear_log.setText(t("clear_log"))
+        self.btn_save_log.setText(t("save_log"))
+        self.htext.setPlaceholderText(t("filter_text"))
+        backend_labels = {
+            "auto": t("backend_auto"),
+            "builtin": t("backend_builtin"),
+            "ookla": t("backend_ookla"),
+            "demo": t("backend_demo"),
+        }
+        current = self.combo_backend.currentData() or "auto"
+        self.combo_backend.blockSignals(True)
+        self.combo_backend.clear()
+        for code, label in backend_labels.items():
+            self.combo_backend.addItem(label, code)
+        index = self.combo_backend.findData(current)
+        self.combo_backend.setCurrentIndex(index if index >= 0 else 0)
+        self.combo_backend.blockSignals(False)
+        labels = {
+            "language": t("language"),
+            "unit": t("unit"),
+            "backend": t("backend"),
+            "repeat": t("repeat"),
+            "timeout_conn": t("timeout_conn"),
+            "timeout_cmd": t("timeout_cmd"),
+            "timeout_test": t("timeout_test"),
+            "duration": t("duration"),
+            "connections": t("connections"),
+            "serial": t("serial"),
+            "accept_license": t("accept_license"),
+            "vpn_mode": t("vpn_mode"),
+            "disconnect_existing": t("disconnect_existing"),
+        }
+        form = self._settings_tab_layout()
+        for row, (key, _w) in enumerate(self._form_rows):
+            item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            if item and item.widget():
+                item.widget().setText(labels[key])
+        self._unit_changed(self.combo_unit.currentText())
+
+    def _settings_tab_layout(self) -> QFormLayout:
+        return self.tabs.widget(4).layout()
+
+    def _backend(self) -> str:
+        return self.combo_backend.currentData() or "auto"
+
+    def _unit_changed(self, unit: str):
+        self.gauge_down.set_unit(unit)
+        self.gauge_up.set_unit(unit)
+        self._refresh_history()
+
+    # ------------------------------------------------------------- servers
+    def _payload(self, servers: list[Server]) -> dict:
+        return {
+            "servers": [s.to_dict() for s in servers],
+            "backend": self._backend(),
+            "repeat": self.spin_repeat.value(),
+            "conn_timeout": self.spin_conn_to.value(),
+            "cmd_timeout": self.spin_cmd_to.value(),
+            "test_timeout": self.spin_test_to.value(),
+            "duration": self.spin_duration.value(),
+            "connections": self.spin_conns.value(),
+            "accept_license": self.chk_accept.isChecked(),
+            "vpn_mode": self.chk_vpn.isChecked(),
+        }
+
+    def _run_worker(self, action: str, payload: dict):
+        self.worker = TestWorker(action, payload, self)
+        self.worker.log.connect(self.log_line)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.record.connect(self._on_record)
+        self.worker.fetched.connect(self._on_fetched)
+        self.worker.busy.connect(self._on_busy)
+        self.worker.start()
+
+    def fetch_servers(self):
+        self.log_line("Fetching the full server list from Speedtest.net …")
+        self._run_worker("fetch", self._payload([]))
+
+    def load_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, tr(self.lang, "load_file"), "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            self.servers = load_servers_file(path, log=self.log_line)
+        except CheckerError as exc:
+            self.log_line(f"✗ {exc}")
+            return
+        self.refresh_server_tree()
+
+    def _on_fetched(self, items: list):
+        self.servers = [Server.from_dict(d) for d in items]
+        self.log_line(
+            f"Server list ready: {len(self.servers)} servers. "
+            "Pick any server, or run a batch test in the chosen order."
+        )
+        self.refresh_server_tree()
+        self.tabs.setCurrentIndex(1)
+
+    def _displayed_servers(self) -> list[Server]:
+        needle = self.search.text().strip().casefold()
+        servers = [
+            s
+            for s in self.servers
+            if not needle
+            or needle in f"{s.label} {s.country} {s.city} {s.sponsor} {s.host}".casefold()
+        ]
+        return sort_servers(servers, self.combo_sort.currentText())
+
+    def refresh_server_tree(self):
+        self.tree.clear()
+        servers = self._displayed_servers()
+        groups = group_servers(servers, self.combo_group.currentText())
+        unit = self.combo_unit.currentText()
+        for group, members in groups.items():
+            parent = QTreeWidgetItem(self.tree, [group or "—", "", "", "", ""]) if group else None
+            root = parent if parent else self.tree.invisibleRootItem()
+            for s in members:
+                item = QTreeWidgetItem(
+                    root,
+                    [
+                        s.label,
+                        s.sponsor,
+                        s.host,
+                        f"{s.distance_km:.0f} km" if s.distance_km is not None else "—",
+                        f"{s.latency_ms:.0f} ms" if s.latency_ms is not None else "—",
+                    ],
+                )
+                item.setData(0, Qt.ItemDataRole.UserRole, s.host)
+            if parent:
+                parent.setExpanded(True)
+        _ = unit
+
+    def _selected_servers(self) -> list[Server]:
+        hosts = []
+        for item in self.tree.selectedItems():
+            host = item.data(0, Qt.ItemDataRole.UserRole)
+            if host:
+                hosts.append(host)
+            else:  # group selected → all its children
+                for i in range(item.childCount()):
+                    hosts.append(item.child(i).data(0, Qt.ItemDataRole.UserRole))
+        by_host = {s.host: s for s in self.servers}
+        return [by_host[h] for h in dict.fromkeys(hosts) if h in by_host]
+
+    # -------------------------------------------------------------- testing
+    def start_tests(self, batch: bool):
+        if not self.servers and self._backend() == "demo":
+            self.servers = demo_servers()
+            self.refresh_server_tree()
+            self.log_line("Demo mode: loaded the offline simulated server list.")
+        servers = self._displayed_servers() if batch else self._selected_servers()
+        if not servers:
+            if not batch and self.servers:
+                servers = self._displayed_servers()[:1]
+            else:
+                self.log_line("No server selected — fetch the server list first (Servers tab).")
+                self.tabs.setCurrentIndex(1)
+                return
+        self.gauge_down.reset()
+        self.gauge_up.reset()
+        self.chart.clear_chart()
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText(
+            f"{tr(self.lang, 'testing')} {len(servers)} server(s), "
+            f"{tr(self.lang, 'avg_of').format(n=self.spin_repeat.value())}"
+        )
+        self.log_line(
+            f"Starting {'batch' if batch else 'single'} test: {len(servers)} server(s), "
+            f"repeat={self.spin_repeat.value()}, unit={self.combo_unit.currentText()}, "
+            f"connection timeout={self.spin_conn_to.value():g}s"
+        )
+        self._run_worker("batch" if batch or len(servers) > 1 else "single", self._payload(servers))
+
+    def stop_tests(self):
+        if self.worker:
+            self.worker.cancel_event.set()
+            self.log_line("Stop requested — finishing the current operation…")
+
+    def _on_busy(self, busy: bool):
+        for b in (self.btn_start, self.btn_fetch, self.btn_test_sel, self.btn_batch, self.btn_load):
+            b.setEnabled(not busy)
+        self.btn_stop.setEnabled(busy)
+        if not busy:
+            self.lbl_status.setText(tr(self.lang, "ready"))
+            self.progress_bar.setValue(100 if self.progress_bar.value() else 0)
+
+    def _on_progress(self, phase: str, mbps: float, done: int):
+        unit = self.combo_unit.currentText()
+        if phase == "download":
+            self.gauge_down.set_value(convert_speed(mbps, unit))
+        elif phase == "upload":
+            self.gauge_up.set_value(convert_speed(mbps, unit))
+        if phase in ("download", "upload"):
+            self.chart.push(phase, mbps)
+            self.lbl_live.setText(
+                f"{tr(self.lang, 'live')}: {phase} "
+                f"{convert_speed(mbps, unit):.2f} {unit}  ({format_size(done)})"
+            )
+            self.progress_bar.setValue(50 if phase == "download" else 90)
+
+    def _on_record(self, record: dict):
+        try:
+            self.history.append(record)
+        except CheckerError as exc:
+            self.log_line(f"✗ history: {exc}")
+        self._refresh_history()
+        if record.get("download_mbps") is not None:
+            unit = self.combo_unit.currentText()
+            self.gauge_down.set_value(convert_speed(record["download_mbps"], unit))
+            self.gauge_up.set_value(convert_speed(record["upload_mbps"], unit))
+            self.lbl_latency.setText(f"{tr(self.lang, 'latency')}: {record['latency_ms']} ms")
+            self.lbl_server.setText(
+                f"{tr(self.lang, 'jitter_server')}: {record['location']} ({record['server']})"
+            )
+        self.tabs.setCurrentIndex(0)
+
+    # ------------------------------------------------------------- history
+    def _refresh_history(self):
+        try:
+            records = self.history.load()
+        except CheckerError as exc:
+            self.log_line(f"✗ {exc}")
+            return
+        records = filter_history(
+            records,
+            status=self.combo_hstatus.currentText(),
+            text=self.htext.text(),
+            min_download=self.hmin_down.value() or None,
+            max_latency=self.hmax_lat.value() or None,
+        )
+        unit = self.combo_unit.currentText()
+        self.history_table.setRowCount(0)
+        for record in reversed(records):
+            row = self.history_table.rowCount()
+            self.history_table.insertRow(row)
+            down = record.get("download_mbps")
+            up = record.get("upload_mbps")
+            values = [
+                str(record.get("time", ""))[:19].replace("T", " "),
+                str(record.get("location", "")),
+                str(record.get("server", "")),
+                f"{convert_speed(down, unit):.2f} {unit}" if down is not None else "—",
+                f"{convert_speed(up, unit):.2f} {unit}" if up is not None else "—",
+                f"{record['latency_ms']}" if record.get("latency_ms") is not None else "—",
+                str(record.get("status", "")),
+                str(record.get("error", "")),
+            ]
+            for col, value in enumerate(values):
+                self.history_table.setItem(row, col, QTableWidgetItem(value))
+
+    def _clear_history(self):
+        self.history.clear()
+        self._refresh_history()
+        self.log_line("History cleared.")
+
+    def _export_history(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr(self.lang, "export"), "history.json", "JSON (*.json)"
+        )
+        if path:
+            Path(path).write_text(
+                json.dumps(self.history.load(), indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            self.log_line(f"History exported to {path}")
+
+    # ---------------------------------------------------------------- logs
+    def log_line(self, message: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_view.appendPlainText(f"[{stamp}] {message}")
+
+    def _save_log(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr(self.lang, "save_log"), "speedchecker.log", "Log (*.log *.txt)"
+        )
+        if path:
+            Path(path).write_text(self.log_view.toPlainText(), encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    app = QApplication(list(argv) if argv else sys.argv[:1])
+    app.setApplicationName("SpeedChecker")
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

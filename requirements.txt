@@ -1,0 +1,4 @@
+# SpeedChecker runtime dependencies.
+# NOTE: the project itself is NOT installed (no `pip install .` needed) —
+# app.py puts src/ on sys.path. Only this dependency is installed:
+PyQt6>=6.6

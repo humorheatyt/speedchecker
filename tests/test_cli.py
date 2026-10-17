@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -8,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vpnchecker.cli import main, parser
+from speedchecker.cli import main, parser
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,7 +39,7 @@ class CLITests(unittest.TestCase):
     def test_demo_does_not_check_external_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.json"
-            with patch("vpnchecker.cli.check_dependencies") as check:
+            with patch("speedchecker.cli.check_dependencies") as check:
                 with contextlib.redirect_stdout(io.StringIO()):
                     code = main([str(ROOT / "locations.json"), "--demo", "-o", str(path)])
             self.assertEqual(code, 0)
@@ -52,7 +53,7 @@ class CLITests(unittest.TestCase):
                 cmd = [
                     sys.executable,
                     "-m",
-                    "vpnchecker",
+                    "speedchecker",
                     str(ROOT / "locations.json"),
                     "--demo",
                     "-r",
@@ -60,13 +61,15 @@ class CLITests(unittest.TestCase):
                     "-o",
                     str(path),
                 ] + (["-s"] if serial else [])
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 report = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(len(report["VPNStats"]), 3)
                 self.assertEqual(report["Baseline"]["SuccessfulTests"], 3)
                 # Existing results are not clobbered on a subsequent invocation.
                 before = path.read_bytes()
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env)
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(path.read_bytes(), before)
