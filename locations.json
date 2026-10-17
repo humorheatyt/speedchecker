@@ -1,0 +1,16 @@
+{
+	"locations": [
+		{
+			"country": "Netherlands",
+			"city": "Amsterdam"
+		},
+		{
+			"country": "Romania",
+			"city": "Bucharest"
+		},
+		{
+			"country": "Canada",
+			"city": "Toronto"
+		}
+	]
+}

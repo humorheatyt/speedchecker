@@ -1,0 +1,53 @@
+name: Python
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        include:
+          - os: windows-latest
+            python: '3.12'
+          - os: macos-latest
+            python: '3.12'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install .
+      - run: python -m unittest discover -s tests -v
+      - run: vpnchecker --help
+      - run: expressvpnspeedtest --version
+      - run: python -m vpnchecker --demo -s -r 2 locations.json
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m build
+      - name: Install built wheel in isolation
+        run: |
+          python -m venv /tmp/vpnchecker-wheel
+          /tmp/vpnchecker-wheel/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/vpnchecker-wheel/bin/vpnchecker --version
+          /tmp/vpnchecker-wheel/bin/expressvpnspeedtest --help
