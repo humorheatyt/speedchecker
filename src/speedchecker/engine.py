@@ -7,9 +7,10 @@ enough. It speaks to ordinary Speedtest.net servers over HTTP:
 * download – streamed ``random{350,500,750,1000,1500,2000,2500,3000,3500,4000}x…jpg``
 * upload   – POST of generated payloads to the server's upload endpoint
 
-Progress is reported live through ``progress(phase, live_mbps, bytes_done)``
-so the GUI gauges/chart move in real time. Cancellation is cooperative
-via a ``threading.Event``.
+Progress is reported live through ``progress(phase, value, bytes_done)``:
+``value`` is Mbps for download/upload and milliseconds for latency. This keeps
+both gauges, the chart, and the ping readout current in real time. Cancellation
+is cooperative via a ``threading.Event``.
 """
 
 import http.client
@@ -69,6 +70,7 @@ class BuiltinSpeedtest:
                 continue
             elapsed = (time.perf_counter() - start) * 1000
             best = elapsed if best is None else min(best, elapsed)
+            self.progress("latency", best, 0)
         if best is None:  # fall back to a raw TCP connect timing
             import socket
 
@@ -81,21 +83,36 @@ class BuiltinSpeedtest:
             except OSError as exc:
                 raise CheckerError(f"Cannot reach {server.host}: {exc}") from exc
             best = (time.perf_counter() - start) * 1000
+            self.progress("latency", best, 0)
         self.log(f"  latency {best:.2f} ms")
         return best
 
     def _transfer(self, server: Server, phase: str) -> float:
         """Run one phase with N parallel workers; return average Mbps."""
-        total = [0]
+        total = [0]  # bytes accepted for the final throughput result
+        live_total = [0]  # bytes transferred so far, including in-flight uploads
         lock = threading.Lock()
         deadline = time.monotonic() + self.duration
         started = time.monotonic()
 
+        def report_progress(n: int, *, accepted: bool) -> None:
+            with lock:
+                live_total[0] += n
+                if accepted:
+                    total[0] += n
+                progress_bytes = live_total[0]
+            elapsed = max(time.monotonic() - started, 0.001)
+            self.progress(phase, progress_bytes * 8 / elapsed / 1_000_000, progress_bytes)
+
         def bump(n: int) -> None:
+            report_progress(n, accepted=True)
+
+        def report_upload_chunk(n: int) -> None:
+            report_progress(n, accepted=False)
+
+        def accept_upload(n: int) -> None:
             with lock:
                 total[0] += n
-            elapsed = max(time.monotonic() - started, 0.001)
-            self.progress(phase, total[0] * 8 / elapsed / 1_000_000, total[0])
 
         def download_worker() -> None:
             size_index = 0
@@ -123,7 +140,7 @@ class BuiltinSpeedtest:
             while time.monotonic() < deadline and not self.cancel.is_set():
                 size = _PAYLOADS[min(index, len(_PAYLOADS) - 1)]
                 index += 1
-                payload = rng.randbytes(min(size, 1_000_000))
+                body = rng.randbytes(size)
                 parts = urllib.parse.urlsplit(server.url or server.base_url + "upload.php")
                 conn = None
                 try:
@@ -133,21 +150,26 @@ class BuiltinSpeedtest:
                         else http.client.HTTPConnection
                     )
                     conn = conn_cls(parts.hostname, parts.port, timeout=self.timeout)
-                    body = payload * max(1, size // len(payload))
-                    conn.request(
-                        "POST",
-                        parts.path or "/",
-                        body=body,
-                        headers={
-                            "Content-Type": "application/octet-stream",
-                            "Content-Length": str(len(body)),
-                        },
-                    )
+                    target = parts.path or "/"
+                    if parts.query:
+                        target = f"{target}?{parts.query}"
+                    conn.putrequest("POST", target)
+                    conn.putheader("Content-Type", "application/octet-stream")
+                    conn.putheader("Content-Length", str(len(body)))
+                    conn.endheaders()
+                    # Send in chunks so upload gauges are refreshed while data
+                    # is actually moving, not only after the server responds.
+                    for offset in range(0, len(body), 65_536):
+                        if self.cancel.is_set():
+                            return
+                        chunk = body[offset : offset + 65_536]
+                        conn.send(chunk)
+                        report_upload_chunk(len(chunk))
                     response = conn.getresponse()
                     response.read()
                     if response.status < 200 or response.status >= 300:
                         raise CheckerError(f"Upload rejected: HTTP {response.status}")
-                    bump(len(body))
+                    accept_upload(len(body))
                 except Exception as exc:
                     self.log(f"  upload stream error: {exc}")
                     time.sleep(0.1)
@@ -185,7 +207,6 @@ class BuiltinSpeedtest:
             f"Testing against {server.label} ({server.host}) sponsored by {server.sponsor or '—'}"
         )
         latency = self._latency(server)
-        self.progress("latency", 0.0, 0)
         download = self._transfer(server, "download")
         upload = self._transfer(server, "upload")
         self.progress("done", 0.0, 0)
@@ -220,6 +241,7 @@ class DemoSpeedtestLive:
         self.log(f"[demo] Testing against {label} ({host})")
         rng = random.Random()
         latency = rng.uniform(8, 45)
+        self.progress("latency", latency, 0)
         results = {}
         for phase, base in (("download", self.base_download), ("upload", self.base_upload)):
             steps = 20

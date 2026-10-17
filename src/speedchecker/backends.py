@@ -9,9 +9,9 @@ from pathlib import Path
 
 from .models import CheckerError, Measurement
 
-# Ookla's own service occasionally drops the transfer stream ("Cannot write")
-# or answers its configuration request with a 5xx.  Those failures are worth
-# one automatic retry; configuration/license errors are not.
+# Ookla's service can drop a transfer stream, answer with a 5xx, or fail its
+# HELLO handshake. These network/protocol failures are worth one retry;
+# configuration/license errors are not.
 _TRANSIENT_MARKERS = (
     "cannot write",
     "cannot retrieve configuration",
@@ -21,12 +21,24 @@ _TRANSIENT_MARKERS = (
     "connection aborted",
     "temporarily unavailable",
     "try again",
+    "did not receive hello",
+    "protocol error",
     "502",
     "503",
     "504",
 )
 
 _HINTS = (
+    (
+        "did not receive hello",
+        "Ookla's protocol handshake failed — retry, check for proxy/firewall filtering, "
+        "or use Auto/Built-in for the live Python engine",
+    ),
+    (
+        "protocol error",
+        "Ookla's protocol handshake failed — retry, check for proxy/firewall filtering, "
+        "or use Auto/Built-in for the live Python engine",
+    ),
     (
         "cannot write",
         "the upload/data stream was interrupted — retry; if it keeps happening "
@@ -246,17 +258,24 @@ class OoklaSpeedtest:
 
 
 class FallbackSpeedtest:
-    """Try the primary engine, then keep using the fallback for later tests.
+    """Try one engine, then keep using its fallback for later measurements."""
 
-    Used by engine mode ``auto``: a transient Ookla failure should not lose the
-    measurement when the built-in pure-Python engine can still provide one.
-    """
-
-    def __init__(self, primary, fallback_factory, log=lambda message: None, on_fallback=None):
+    def __init__(
+        self,
+        primary,
+        fallback_factory,
+        log=lambda message: None,
+        on_fallback=None,
+        *,
+        primary_name="primary",
+        fallback_name="fallback",
+    ):
         self.primary = primary
         self.fallback_factory = fallback_factory
         self.log = log
         self.on_fallback = on_fallback or (lambda: None)
+        self.primary_name = primary_name
+        self.fallback_name = fallback_name
         self._fallback = None
 
     def measure(self) -> Measurement:
@@ -265,10 +284,17 @@ class FallbackSpeedtest:
         try:
             return self.primary.measure()
         except CheckerError as exc:
-            reason = str(exc).replace("\n", " ")
+            if "cancelled by user" in str(exc).casefold():
+                raise
+            reason = " ".join(str(exc).split())
+            if len(reason) > 240:
+                reason = reason[:237] + "..."
             self._fallback = self.fallback_factory()
             self.on_fallback()
-            self.log(f"↻ Auto engine: Ookla failed ({reason}) — using the built-in engine.")
+            self.log(
+                f"↻ Engine fallback: {self.primary_name} failed ({reason}) — "
+                f"using {self.fallback_name}."
+            )
             return self._fallback.measure()
 
 

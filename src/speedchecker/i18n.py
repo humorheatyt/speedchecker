@@ -11,6 +11,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "download": "Download",
         "upload": "Upload",
         "latency": "Latency",
+        "ping": "Ping (ms)",
         "jitter_server": "Server",
         "start_test": "▶  Start Test",
         "stop": "■  Stop",
@@ -46,14 +47,18 @@ STRINGS: dict[str, dict[str, str]] = {
         "download_progress_unknown": "Downloading… {done}",
         "download_done_title": "Ookla CLI downloaded",
         "download_done": "The official Ookla Speedtest CLI was saved to:\n{path}\n\n"
-        "Size: {size}. The Ookla engine is now selected; nothing was installed "
-        "system-wide.",
+        "Size: {size}. Auto keeps the live built-in engine first and uses Ookla "
+        "only if needed. Select Ookla manually for final-only results. Nothing "
+        "was installed system-wide.",
         "download_failed_title": "Ookla download failed",
         "download_failed_status": "Download failed — see the log.",
         "ookla_page": "Ookla website",
         "ookla_page_button": "↗  Official download page",
-        "tip_backend": "Which engine measures speed. Auto uses the bundled Ookla "
-        "binary when present and falls back to the built-in engine if it fails.",
+        "tip_backend": "Which engine measures speed. Auto uses the built-in engine "
+        "first so gauges update live, then falls back to an installed Ookla binary if "
+        "needed. The Ookla CLI reports final results only; its option tries Ookla "
+        "first and falls back "
+        "to the built-in engine on failure.",
         "tip_repeat": "How many times each measurement is repeated; the result is "
         "the average. Repetitions run one after another.",
         "tip_timeout_conn": "How long to wait for ExpressVPN to report a connected "
@@ -83,9 +88,9 @@ STRINGS: dict[str, dict[str, str]] = {
         "duration": "Duration per phase (s)",
         "connections": "Parallel connections (built-in engine)",
         "backend": "Speed engine",
-        "backend_auto": "Auto (bundled Ookla → built-in on failure)",
-        "backend_builtin": "Built-in (bundled, pure Python)",
-        "backend_ookla": "Ookla binary (vendor/ or PATH)",
+        "backend_auto": "Auto (live built-in → Ookla fallback if available)",
+        "backend_builtin": "Built-in (live, bundled pure Python)",
+        "backend_ookla": "Ookla first (final-only; built-in fallback)",
         "backend_demo": "Demo (simulated)",
         "accept_license": "Accept Ookla license/GDPR",
         "vpn_mode": "Connect to selected ExpressVPN location",
@@ -96,7 +101,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "ok_only": "Successful only",
         "errors_only": "Errors only",
         "min_download": "Min download (Mbps)",
-        "max_latency": "Max latency (ms)",
+        "max_latency": "Max ping (ms)",
         "filter_text": "Filter text…",
         "clear_history": "Clear history",
         "export": "Export…",
@@ -125,7 +130,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "settings": "تنظیمات",
         "download": "دانلود",
         "upload": "آپلود",
-        "latency": "پینگ",
+        "latency": "تأخیر",
+        "ping": "پینگ (ms)",
         "jitter_server": "سرور",
         "start_test": "▶  شروع تست",
         "stop": "■  توقف",
@@ -161,13 +167,17 @@ STRINGS: dict[str, dict[str, str]] = {
         "download_progress_unknown": "در حال دانلود… {done}",
         "download_done_title": "باینری Ookla دانلود شد",
         "download_done": "باینری رسمی Ookla در این مسیر ذخیره شد:\n{path}\n\n"
-        "حجم: {size}. موتور Ookla انتخاب شد؛ هیچ نصب سیستمی انجام نشد.",
+        "حجم: {size}. حالت خودکار ابتدا از موتور داخلی زنده استفاده می‌کند و در "
+        "صورت نیاز به Ookla برمی‌گردد. برای نتیجهٔ نهایی Ookla را دستی انتخاب کنید. "
+        "نصب سیستمی انجام نشد.",
         "download_failed_title": "دانلود Ookla ناموفق بود",
         "download_failed_status": "دانلود ناموفق — جزئیات در لاگ",
         "ookla_page": "سایت Ookla",
         "ookla_page_button": "↗  صفحهٔ رسمی دانلود",
-        "tip_backend": "موتوری که سرعت را می‌سنجد. حالت خودکار از باینری همراه "
-        "استفاده می‌کند و در صورت خطا به موتور داخلی برمی‌گردد.",
+        "tip_backend": "موتوری که سرعت را می‌سنجد. حالت خودکار ابتدا از موتور داخلی "
+        "استفاده می‌کند تا کیلومترشمار زنده باشد و در صورت نیاز به Ookla برمی‌گردد. "
+        "CLI اوکلا فقط نتیجهٔ نهایی را می‌دهد؛ گزینهٔ Ookla ابتدا آن را امتحان می‌کند "
+        "و در صورت خطا به موتور داخلی برمی‌گردد.",
         "tip_repeat": "تعداد تکرار هر اندازه‌گیری؛ نتیجه میانگین آن‌هاست. تکرارها "
         "پشت سر هم اجرا می‌شوند.",
         "tip_timeout_conn": "مدت انتظار برای گزارش وضعیت متصل/قطع‌شده از "
@@ -197,9 +207,9 @@ STRINGS: dict[str, dict[str, str]] = {
         "duration": "مدت هر فاز (ثانیه)",
         "connections": "اتصال‌های موازی (موتور داخلی)",
         "backend": "موتور تست سرعت",
-        "backend_auto": "خودکار (Ookla همراه ← داخلی در صورت خطا)",
-        "backend_builtin": "داخلی (همراه پروژه، پایتون خالص)",
-        "backend_ookla": "باینری Ookla (پوشه vendor یا PATH)",
+        "backend_auto": "خودکار (موتور داخلی زنده ← Ookla در صورت نصب و خطا)",
+        "backend_builtin": "داخلی (زنده، پایتون خالص همراه پروژه)",
+        "backend_ookla": "ابتدا Ookla (فقط نتیجهٔ نهایی؛ موتور داخلی جایگزین)",
         "backend_demo": "دمو (شبیه‌سازی)",
         "accept_license": "پذیرش لایسنس/GDPR اوکلا",
         "vpn_mode": "اتصال به لوکیشن انتخابی ExpressVPN",

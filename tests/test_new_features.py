@@ -127,7 +127,8 @@ class EngineTests(unittest.TestCase):
         )
         result = engine.measure()
         self.assertGreater(result.download_mbps, 0)
-        self.assertEqual({p for p, _ in seen}, {"download", "upload"})
+        self.assertEqual({p for p, _ in seen}, {"latency", "download", "upload"})
+        self.assertTrue(any(p == "latency" and m > 0 for p, m in seen))
 
     def test_demo_engine_cancellation(self):
         import threading
@@ -176,14 +177,59 @@ class EngineTests(unittest.TestCase):
             host=f"127.0.0.1:{port}",
             url=f"http://127.0.0.1:{port}/speedtest/upload.php",
         )
-        phases = []
+        progress = []
         result = BuiltinSpeedtest(
-            server, timeout=5, duration=1, connections=2, progress=lambda p, m, b: phases.append(p)
+            server,
+            timeout=5,
+            duration=1,
+            connections=2,
+            progress=lambda phase, value, done: progress.append((phase, value, done)),
         ).measure()
         self.assertGreater(result.download_mbps, 0)
         self.assertGreater(result.upload_mbps, 0)
+        self.assertGreater(result.latency_ms, 0)
         self.assertEqual(result.server_location, "Testland, Local")
-        self.assertGreaterEqual(set(phases), {"download", "upload"})
+        phases = {phase for phase, _, _ in progress}
+        self.assertGreaterEqual(phases, {"latency", "download", "upload"})
+        self.assertGreater(sum(phase == "upload" for phase, _, _ in progress), 1)
+
+    def test_rejected_upload_shows_live_progress_but_is_not_counted_as_success(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from speedchecker.engine import BuiltinSpeedtest
+
+        class RejectingHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                remaining = int(self.headers.get("Content-Length", 0))
+                while remaining > 0:
+                    remaining -= len(self.rfile.read(min(remaining, 65_536)))
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        http = ThreadingHTTPServer(("127.0.0.1", 0), RejectingHandler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.shutdown)
+        port = http.server_address[1]
+        server = Server(
+            host=f"127.0.0.1:{port}",
+            url=f"http://127.0.0.1:{port}/upload.php",
+        )
+        progress = []
+        engine = BuiltinSpeedtest(
+            server,
+            timeout=3,
+            duration=1,
+            connections=1,
+            progress=lambda phase, value, done: progress.append((phase, value, done)),
+        )
+        with self.assertRaisesRegex(CheckerError, "Upload test transferred no data"):
+            engine._transfer(server, "upload")
+        self.assertTrue(any(phase == "upload" and done > 0 for phase, _, done in progress))
 
     def test_bundled_binary_prefers_vendor(self):
         with tempfile.TemporaryDirectory() as d:
