@@ -29,9 +29,22 @@ jobs:
           python-version: ${{ matrix.python }}
       # The project is NOT installed as a module: only requirements are.
       - run: python -m pip install -r requirements.txt pytest
-      - run: python -m pytest tests/ -q
+      - run: |
+          python -m pytest tests/ -v --tb=short 2>&1 | tee /tmp/pytest.log
+          echo "PYTEST_EXIT=$?" >> $GITHUB_ENV
+      - name: Upload pytest log
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log-${{ matrix.python }}-${{ matrix.os }}
+          path: /tmp/pytest.log
+        if: always()
+      - name: Show pytest log on failure
+        if: env.PYTEST_EXIT != '0'
+        run: cat /tmp/pytest.log
       - run: python app.py --cli --help
+        if: env.PYTEST_EXIT == '0'
       - run: python app.py --cli --demo -s -r 2 locations.json -o ${{ runner.temp }}/report.json
+        if: env.PYTEST_EXIT == '0'
 
   quality:
     runs-on: ubuntu-latest
