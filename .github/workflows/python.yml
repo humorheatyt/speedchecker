@@ -38,6 +38,13 @@ jobs:
           name: pytest-log-${{ matrix.python }}-${{ matrix.os }}
           path: /tmp/pytest.log
         if: always()
+      - name: Add log to summary
+        if: always()
+        run: |
+          echo '### Pytest log' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/pytest.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
       - name: Show pytest log on failure
         if: env.PYTEST_EXIT != '0'
         run: cat /tmp/pytest.log
