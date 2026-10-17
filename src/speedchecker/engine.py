@@ -24,7 +24,9 @@ from .models import CheckerError, Measurement
 from .servers import Server
 
 _SIZES = (350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000)
-_PAYLOADS = (100_000, 300_000, 500_000, 800_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000)
+# Keep uploads ≤1.5 MiB — larger bodies trigger HTTP 500 on many
+# Speedtest.net hosts and trip Windows firewall/AV (WSAECONNABORTED 10053).
+_PAYLOADS = (100_000, 300_000, 500_000, 800_000, 1_000_000, 1_500_000)
 
 
 class BuiltinSpeedtest:
@@ -137,9 +139,9 @@ class BuiltinSpeedtest:
         def upload_worker() -> None:
             index = 0
             rng = random.Random()
+            consecutive_errors = 0
             while time.monotonic() < deadline and not self.cancel.is_set():
                 size = _PAYLOADS[min(index, len(_PAYLOADS) - 1)]
-                index += 1
                 body = rng.randbytes(size)
                 parts = urllib.parse.urlsplit(server.url or server.base_url + "upload.php")
                 conn = None
@@ -154,8 +156,15 @@ class BuiltinSpeedtest:
                     if parts.query:
                         target = f"{target}?{parts.query}"
                     conn.putrequest("POST", target)
+                    # Host must include port for non-standard ports (e.g. :8080)
+                    # or some servers return 500.
+                    if parts.netloc:
+                        conn.putheader("Host", parts.netloc)
+                    conn.putheader("User-Agent", "speedchecker/2.0")
                     conn.putheader("Content-Type", "application/octet-stream")
                     conn.putheader("Content-Length", str(len(body)))
+                    conn.putheader("Connection", "close")
+                    conn.putheader("Accept", "*/*")
                     conn.endheaders()
                     # Send in chunks so upload gauges are refreshed while data
                     # is actually moving, not only after the server responds.
@@ -170,12 +179,26 @@ class BuiltinSpeedtest:
                     if response.status < 200 or response.status >= 300:
                         raise CheckerError(f"Upload rejected: HTTP {response.status}")
                     accept_upload(len(body))
+                    consecutive_errors = 0
+                    # Grow payload on success; shrink on failure to stay compatible.
+                    index = min(index + 1, len(_PAYLOADS) - 1)
+                except CheckerError as exc:
+                    # HTTP 5xx / explicit rejection — try smaller body next time
+                    self.log(f"  upload stream error: {exc}")
+                    consecutive_errors += 1
+                    index = max(0, index - 1) if consecutive_errors >= 2 else index
+                    time.sleep(0.15)
                 except Exception as exc:
                     self.log(f"  upload stream error: {exc}")
-                    time.sleep(0.1)
+                    consecutive_errors += 1
+                    # On transport errors (e.g. WinError 10053) keep size stable
+                    time.sleep(0.15)
                 finally:
                     if conn is not None:
-                        conn.close()
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
 
         worker = download_worker if phase == "download" else upload_worker
         self.log(

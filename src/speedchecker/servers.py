@@ -83,16 +83,38 @@ def _get_json(url: str, timeout: float, log) -> object:
     return json.loads(payload.decode("utf-8", "replace"))
 
 
+# Cached last successful fetch — reused when a later fetch fails
+# (e.g. DNS blocked inside a VPN tunnel).
+_CACHED_SERVERS: list[Server] | None = None
+
+
 def fetch_servers(timeout: float = 15.0, log=lambda msg: None) -> list[Server]:
-    """Download the API's nearby speed-test servers (not VPN locations)."""
+    """Download the API's nearby speed-test servers (not VPN locations).
+
+    The ``config`` endpoint is deprecated (404 on speedtest.net) — its failure
+    is ignored silently and distance sorting is simply unavailable.  If the
+    main server list cannot be fetched but a previous successful fetch is
+    cached, the cached list is returned so a VPN tunnel with broken DNS does
+    not make every later test fail.
+    """
+    global _CACHED_SERVERS
     try:
         client_lat = client_lon = None
         try:
             config = _get_json(CONFIG_API, timeout, log)
             client = config.get("client", {}) if isinstance(config, dict) else {}
             client_lat, client_lon = float(client.get("lat", 0)), float(client.get("lon", 0))
+            if not math.isfinite(client_lat) or not math.isfinite(client_lon) or (
+                client_lat == 0 and client_lon == 0
+            ):
+                raise ValueError("invalid coordinates")
         except Exception as exc:  # config is optional; distance just stays unknown
-            log(f"Config fetch failed (continuing without distance): {exc}")
+            msg = str(exc)
+            # The old /api/js/config endpoint now returns 404 — not an error.
+            if "404" in msg or "Not Found" in msg:
+                log("Client location not available — distance will be shown as — (config endpoint deprecated).")
+            else:
+                log(f"Client location unavailable (continuing without distance): {exc}")
         raw = _get_json(SERVERS_API, timeout, log)
         if not isinstance(raw, list) or not raw:
             raise CheckerError("Speedtest.net returned an empty server list.")
@@ -122,10 +144,17 @@ def fetch_servers(timeout: float = 15.0, log=lambda msg: None) -> list[Server]:
         if not servers:
             raise CheckerError("No usable servers in the Speedtest.net response.")
         log(f"Loaded {len(servers)} servers.")
+        _CACHED_SERVERS = list(servers)
         return servers
     except CheckerError:
         raise
     except Exception as exc:
+        # If we have a cached list (e.g. fetched before VPN), reuse it when
+        # DNS inside the tunnel is broken. This keeps VPN tests from failing
+        # outright when speedtest.net cannot be resolved via the tunnel.
+        if _CACHED_SERVERS is not None:
+            log(f"Server list fetch failed ({exc}) — using {len(_CACHED_SERVERS)} cached servers.")
+            return list(_CACHED_SERVERS)
         raise CheckerError(f"Cannot fetch server list: {exc}") from exc
 
 

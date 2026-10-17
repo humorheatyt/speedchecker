@@ -9,12 +9,23 @@ from pathlib import Path
 
 from .models import CheckerError, Measurement
 
-# Ookla's service can drop a transfer stream, answer with a 5xx, or fail its
-# HELLO handshake. These network/protocol failures are worth one retry;
-# configuration/license errors are not.
+# Ookla's service can drop a transfer stream, answer with a 5xx, fail its
+# HELLO handshake, or be unreachable via the VPN tunnel (DNS). These
+# network/protocol failures are worth a retry; configuration/license errors
+# are not.
 _TRANSIENT_MARKERS = (
     "cannot write",
     "cannot retrieve configuration",
+    "could not retrieve configuration",
+    "could not read configuration",
+    "configurationerror",
+    "couldn't resolve host",
+    "could not resolve host",
+    "hostnotfound",
+    "host not found",
+    "name resolution",
+    "11004",
+    "wsa error",
     "cannot open",
     "connection reset",
     "connection refused",
@@ -47,7 +58,24 @@ _HINTS = (
     (
         "cannot retrieve configuration",
         "Ookla's configuration service could not be reached — check the internet "
-        "connection or VPN and retry",
+        "connection, VPN DNS, and firewall, or use the built-in engine (Auto/Built-in)",
+    ),
+    (
+        "could not retrieve configuration",
+        "Ookla's configuration service could not be reached — check the internet "
+        "connection, VPN DNS, and firewall, or use the built-in engine (Auto/Built-in)",
+    ),
+    (
+        "hostnotfound",
+        "Ookla could not resolve the host — check VPN DNS, firewall, or try the built-in engine",
+    ),
+    (
+        "couldn't resolve host",
+        "Ookla could not resolve the host — check VPN DNS, firewall, or try the built-in engine",
+    ),
+    (
+        "wsa error",
+        "Windows network error (WSA) — check VPN, firewall/antivirus, or MTU, or keep the built-in engine",
     ),
     (
         "timed out",
