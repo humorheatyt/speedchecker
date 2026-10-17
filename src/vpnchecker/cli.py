@@ -10,7 +10,6 @@ from pathlib import Path
 from . import __version__
 from .backends import DemoSpeedtest, DemoVPN, ExpressVPN, OoklaSpeedtest, check_dependencies
 from .benchmark import benchmark
-from .bundled import BundledSpeedtest
 from .models import CheckerError, load_locations, slug
 from .storage import ReportStore
 
@@ -37,15 +36,9 @@ def positive_float(value: str) -> float:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Speedchecker: benchmark ExpressVPN with the bundled speedtest client.",
+        description="Benchmark ExpressVPN locations using the official Ookla Speedtest CLI.",
         epilog="Tests consume substantial data. VPN connections made by this tool are disconnected "
         "after testing. Use --demo for an offline simulation without network changes.",
-    )
-    result.add_argument(
-        "--backend",
-        choices=["bundled", "ookla"],
-        default="bundled",
-        help="bundled Python client (default) or optional external Ookla CLI",
     )
     result.add_argument("input_file", type=Path, help="JSON file containing a locations array")
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -111,15 +104,14 @@ def main(argv: list[str] | None = None) -> int:
             speedtest = DemoSpeedtest(vpn)
             print("DEMO: synthetic measurements; no network or VPN changes.")
         else:
-            check_dependencies(require_speedtest=args.backend == "ookla")
+            check_dependencies()
             vpn = ExpressVPN(
                 command_timeout=args.command_timeout,
                 connection_timeout=args.connection_timeout,
             )
-            speedtest = (
-                OoklaSpeedtest(timeout=args.speedtest_timeout, accept_license=args.accept_license)
-                if args.backend == "ookla"
-                else BundledSpeedtest(timeout=args.speedtest_timeout)
+            speedtest = OoklaSpeedtest(
+                timeout=args.speedtest_timeout,
+                accept_license=args.accept_license,
             )
         output = args.output or Path(
             "results-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json"

@@ -76,8 +76,6 @@ class SubprocessIntegrationTests(unittest.TestCase):
                 "vpnchecker",
                 str(self.input),
                 "--accept-license",
-                "--backend",
-                "ookla",
                 "-r",
                 "3",
                 "--output",
