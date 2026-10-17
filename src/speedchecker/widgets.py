@@ -150,6 +150,8 @@ class GaugeWidget(QWidget):
         self._title, self._color = title, QColor(color)
         self._value, self._max = 0.0, 100.0
         self._unit = "Mbps"
+        self._has_value = False
+        self._low_samples = 0
         self.setMinimumSize(230, 230)
 
     def set_title(self, title: str) -> None:
@@ -160,15 +162,51 @@ class GaugeWidget(QWidget):
         self._unit = unit
         self.update()
 
+    @staticmethod
+    def _scale_for(value: float) -> float:
+        """Choose a readable 1/2/5 scale with headroom above the needle."""
+        if value <= 0 or not math.isfinite(value):
+            return 100.0
+        target = value / 0.75
+        magnitude = 10 ** math.floor(math.log10(target))
+        normalized = target / magnitude
+        step = 1 if normalized <= 1 else 2 if normalized <= 2 else 5 if normalized <= 5 else 10
+        return max(step * magnitude, value)
+
     def set_value(self, value: float) -> None:
         self._value = max(0.0, value)
-        if self._value > self._max:  # adaptive scale
-            self._max = self._value * 1.25
+        if not self._has_value:
+            self._max = self._scale_for(self._value)
+            self._has_value = True
+            self._low_samples = 0
+        elif self._value > self._max:
+            self._max = self._scale_for(self._value)
+            self._low_samples = 0
+        elif self._value < self._max * 0.25:
+            # Shrink only after several low samples to avoid a twitchy needle
+            # when measured speed varies around the current scale.
+            self._low_samples += 1
+            if self._low_samples >= 4:
+                self._max = self._scale_for(self._value)
+                self._low_samples = 0
+        else:
+            self._low_samples = 0
         self.update()
 
     def reset(self) -> None:
         self._value, self._max = 0.0, 100.0
+        self._has_value = False
+        self._low_samples = 0
         self.update()
+
+    def _tick_label(self, value: float) -> str:
+        if self._max >= 100:
+            return f"{value:.0f}"
+        if self._max >= 10:
+            return f"{value:.1f}".rstrip("0").rstrip(".")
+        if self._max >= 1:
+            return f"{value:.2f}".rstrip("0").rstrip(".")
+        return f"{value:.3g}"
 
     def paintEvent(self, event):  # noqa: N802 (Qt API)
         painter = QPainter(self)
@@ -201,7 +239,7 @@ class GaugeWidget(QWidget):
                 center.y() - (radius - 14) * math.sin(angle),
             )
             painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-            label = f"{self._max * i / 10:.0f}"
+            label = self._tick_label(self._max * i / 10)
             lx, ly = (
                 center.x() + (radius - 42) * math.cos(angle),
                 center.y() - (radius - 42) * math.sin(angle),
@@ -285,15 +323,21 @@ class LiveChart(QWidget):
             painter.drawLine(0, y, self.width(), y)
         peak = max([*self.download, *self.upload, 10.0]) * 1.15
         for series, color in ((self.download, "#22d3ee"), (self.upload, "#a78bfa")):
-            if len(series) < 2:
+            if not series:
                 continue
             painter.setPen(QPen(QColor(color), 2))
-            step = self.width() / 119
+            step = self.width() / max(1, len(series) - 1)
             points = [
                 (int(i * step), int(self.height() - 6 - (v / peak) * (self.height() - 14)))
                 for i, v in enumerate(series)
             ]
-            for (x1, y1), (x2, y2) in zip(points, points[1:], strict=False):
-                painter.drawLine(x1, y1, x2, y2)
+            if len(points) == 1:
+                painter.setBrush(QColor(color))
+                painter.drawEllipse(points[0][0] - 3, points[0][1] - 3, 6, 6)
+            else:
+                for (x1, y1), (x2, y2) in zip(points, points[1:], strict=False):
+                    painter.drawLine(x1, y1, x2, y2)
+                painter.setBrush(QColor(color))
+                painter.drawEllipse(points[-1][0] - 3, points[-1][1] - 3, 6, 6)
         painter.setPen(QColor("#64748b"))
         painter.drawText(8, 16, f"max ≈ {peak / 1.15:.1f} Mbps   ● download   ● upload")

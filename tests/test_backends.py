@@ -83,6 +83,19 @@ class OoklaRecoveryTests(unittest.TestCase):
         self.assertTrue(any("retrying" in line for line in logs))
 
     @patch("speedchecker.backends.bundled_speedtest_binary", return_value="speedtest")
+    def test_protocol_hello_error_is_retried(self, _binary):
+        runner = Mock()
+        runner.run.side_effect = [
+            CheckerError(
+                "speedtest exited with code 2: Protocol error: Did not receive HELLO; input: secret"
+            ),
+            payload(),
+        ]
+        result = OoklaSpeedtest(runner, attempts=2, retry_delay=0).measure()
+        self.assertEqual(result.download_mbps, 100.5)
+        self.assertEqual(runner.run.call_count, 2)
+
+    @patch("speedchecker.backends.bundled_speedtest_binary", return_value="speedtest")
     def test_persistent_failure_has_an_actionable_hint(self, _binary):
         runner = Mock()
         runner.run.side_effect = CheckerError("speedtest exited with code 2: Cannot write")
@@ -121,6 +134,8 @@ class OoklaRecoveryTests(unittest.TestCase):
             lambda: fallback,
             log=logs.append,
             on_fallback=lambda: switched.append(True),
+            primary_name="Ookla",
+            fallback_name="built-in",
         )
         self.assertIs(engine.measure(), fallback.measure.return_value)
         self.assertIs(engine.measure(), fallback.measure.return_value)

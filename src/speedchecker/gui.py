@@ -9,6 +9,7 @@ chart, history with filters, and a live log of everything that happens.
 import json
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean
@@ -100,7 +101,7 @@ def _now() -> str:
 
 class TestWorker(QThread):
     log = pyqtSignal(str)
-    progress = pyqtSignal(str, float, int)  # phase, live Mbps, bytes
+    progress = pyqtSignal(str, float, int)  # phase, Mbps (or ms for latency), bytes
     record = pyqtSignal(dict)  # one finished server record
     downloaded = pyqtSignal(str)
     download_progress = pyqtSignal(int, int)  # bytes done, total (0 = unknown)
@@ -112,68 +113,108 @@ class TestWorker(QThread):
         super().__init__(parent)
         self.action, self.payload = action, payload
         self.cancel_event = threading.Event()
-        self._prefer_builtin = False  # set after an Ookla failure in auto mode
+        self._prefer_builtin = False  # set after Ookla fails during a run
+        self._prefer_ookla = False  # set after the built-in engine fails during Auto
+        self._current_latency_ms: float | None = None
+        self._progress_lock = threading.Lock()
+        self._last_progress_emit: dict[str, float] = {}
 
     # -- engine factory ---------------------------------------------------
+    def _emit_progress(self, phase: str, value: float, done: int) -> None:
+        if phase == "latency":
+            self._current_latency_ms = value
+        elif phase in ("download", "upload"):
+            now = time.monotonic()
+            with self._progress_lock:
+                if now - self._last_progress_emit.get(phase, 0.0) < 0.1:
+                    return
+                self._last_progress_emit[phase] = now
+        self.progress.emit(phase, value, done)
+
     def _builtin_engine(self, server: Server | None):
         p = self.payload
-
-        def emit(phase, mbps, done):
-            self.progress.emit(phase, mbps, done)
-
         return BuiltinSpeedtest(
             server,
             timeout=p["test_timeout"],
             duration=p["duration"],
             connections=p["connections"],
-            progress=emit,
+            progress=self._emit_progress,
+            log=self.log.emit,
+            cancel=self.cancel_event,
+        )
+
+    def _ookla_engine(self, server: Server | None):
+        p = self.payload
+        binary = bundled_speedtest_binary()
+        if binary is None:
+            self.log.emit("Engine: no Ookla binary found in vendor/ or PATH")
+        else:
+            self.log.emit(f"Engine: Ookla binary {binary}")
+        return OoklaSpeedtest(
+            timeout=p["test_timeout"],
+            accept_license=p["accept_license"],
+            server_id=server.id if server and server.id else "",
             log=self.log.emit,
             cancel=self.cancel_event,
         )
 
     def _engine(self, server: Server | None):
         p = self.payload
-        if p["backend"] == "demo":
+        backend = p["backend"]
+        if backend == "demo":
             return DemoSpeedtestLive(
                 server,
                 duration=min(p["duration"], 4.0),
-                progress=lambda phase, mbps, done: self.progress.emit(phase, mbps, done),
+                progress=self._emit_progress,
                 log=self.log.emit,
                 cancel=self.cancel_event,
             )
+
         binary = bundled_speedtest_binary()
-        use_ookla = p["backend"] == "ookla" or (
-            p["backend"] == "auto" and binary and not self._prefer_builtin
-        )
-        if use_ookla:
-            self.log.emit(f"Engine: Ookla binary {binary or 'from PATH'}")
-            engine = OoklaSpeedtest(
-                timeout=p["test_timeout"],
-                accept_license=p["accept_license"],
-                server_id=server.id if server and server.id else "",
-                log=self.log.emit,
-                cancel=self.cancel_event,
-            )
-            if p["backend"] == "auto":
-                # "Auto" only stays automatic if a failed Ookla run can fall
-                # back to the bundled engine instead of losing the result.
-                return FallbackSpeedtest(
-                    engine,
-                    lambda: self._builtin_engine(server),
-                    log=self.log.emit,
-                    on_fallback=self._use_builtin_after_ookla_failure,
+        if backend == "auto":
+            if self._prefer_ookla and binary:
+                self.log.emit(
+                    "Engine: Ookla (Auto fallback from earlier in this run; final result only)"
                 )
-            return engine
-        if p["backend"] == "auto" and self._prefer_builtin:
-            self.log.emit("Engine: built-in (Ookla fallback from earlier in this run)")
-        else:
-            self.log.emit(
-                "Engine: built-in (bundled with the project, no external speedtest needed)"
+                return self._ookla_engine(server)
+            builtin = self._builtin_engine(server)
+            if binary:
+                self.log.emit("Engine: built-in (Auto primary; live progress; Ookla fallback)")
+                return FallbackSpeedtest(
+                    builtin,
+                    lambda: self._ookla_engine(server),
+                    log=self.log.emit,
+                    on_fallback=self._use_ookla_after_builtin_failure,
+                    primary_name="built-in",
+                    fallback_name="Ookla",
+                )
+            self.log.emit("Engine: built-in (live progress; no Ookla binary found)")
+            return builtin
+
+        if backend == "ookla":
+            if self._prefer_builtin:
+                self.log.emit(
+                    "Engine: built-in (Ookla fallback from earlier in this run; live progress)"
+                )
+                return self._builtin_engine(server)
+            self.log.emit("Ookla reports final results only; choose Auto/Built-in for live gauges.")
+            return FallbackSpeedtest(
+                self._ookla_engine(server),
+                lambda: self._builtin_engine(server),
+                log=self.log.emit,
+                on_fallback=self._use_builtin_after_ookla_failure,
+                primary_name="Ookla",
+                fallback_name="built-in",
             )
+
+        self.log.emit("Engine: built-in (live progress; no external speedtest needed)")
         return self._builtin_engine(server)
 
     def _use_builtin_after_ookla_failure(self):
         self._prefer_builtin = True
+
+    def _use_ookla_after_builtin_failure(self):
+        self._prefer_ookla = True
 
     def _vpn(self, regions_servers):
         p = self.payload
@@ -200,6 +241,10 @@ class TestWorker(QThread):
             "connection": "vpn" if vpn else "direct",
         }
         connected = False
+        self._current_latency_ms = None
+        with self._progress_lock:
+            self._last_progress_emit.clear()
+        self.progress.emit("starting", 0.0, 0)
         try:
             if vpn is not None:
                 region = server.host
@@ -217,7 +262,12 @@ class TestWorker(QThread):
                 if self.cancel_event.is_set():
                     raise CheckerError("Test cancelled by user.")
                 self.log.emit(f"— {server.label} ({server.host}) test {i + 1}/{p['repeat']} —")
-                samples.append(engine.measure())
+                sample = engine.measure()
+                samples.append(sample)
+                self._current_latency_ms = sample.latency_ms
+                # Ookla returns ping only in its final JSON; this also keeps
+                # the displayed ping consistent across every backend.
+                self._emit_progress("latency", sample.latency_ms, 0)
             record.update(
                 download_mbps=round(fmean(s.download_mbps for s in samples), 3),
                 upload_mbps=round(fmean(s.upload_mbps for s in samples), 3),
@@ -230,7 +280,14 @@ class TestWorker(QThread):
             )
         except Exception as exc:  # keep batch going; history keeps the error
             record.update(status="error", error=str(exc))
-            self.log.emit(f"✗ {server.label}: {exc}")
+            if self._current_latency_ms is not None:
+                record["latency_ms"] = round(self._current_latency_ms, 2)
+            ping_note = (
+                f" (ping {record['latency_ms']} ms)"
+                if record["latency_ms"] is not None
+                else ""
+            )
+            self.log.emit(f"✗ {server.label}: {exc}{ping_note}")
         finally:
             if connected:
                 try:
@@ -323,6 +380,9 @@ class MainWindow(QMainWindow):
         self.worker: TestWorker | None = None
         self._current_action = ""
         self._downloading = False
+        self._last_download_mbps: float | None = None
+        self._last_upload_mbps: float | None = None
+        self._last_ping_ms: float | None = None
         self._download_logged = 0  # last logged download milestone (25 %)
         self._build_ui()
         self._refresh_history()
@@ -436,6 +496,7 @@ class MainWindow(QMainWindow):
         self.combo_hstatus = QComboBox()
         self.combo_hstatus.addItems(["all", "ok", "error"])
         self.htext = QLineEdit()
+        self.lbl_hmin_down, self.lbl_hmax_lat = QLabel(), QLabel()
         self.hmin_down = QDoubleSpinBox(maximum=100000)
         self.hmin_down.setSpecialValueText("—")
         self.hmax_lat = QDoubleSpinBox(maximum=100000)
@@ -451,7 +512,9 @@ class MainWindow(QMainWindow):
         for widget in (
             self.combo_hstatus,
             self.htext,
+            self.lbl_hmin_down,
             self.hmin_down,
+            self.lbl_hmax_lat,
             self.hmax_lat,
             self.btn_clear_hist,
             self.btn_export,
@@ -562,6 +625,7 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(i, t(key))
         self.gauge_down.set_title(t("download"))
         self.gauge_up.set_title(t("upload"))
+        self._set_ping(self._last_ping_ms)
         self.btn_start.setText(t("start_test"))
         self.btn_stop.setText(t("stop"))
         self.btn_fetch.setText(t("fetch_servers"))
@@ -582,12 +646,14 @@ class MainWindow(QMainWindow):
                 t("jitter_server"),
                 t("download"),
                 t("upload"),
-                t("latency"),
+                t("ping"),
                 t("status"),
                 t("connection"),
                 t("error"),
             ]
         )
+        self.lbl_hmin_down.setText(t("min_download"))
+        self.lbl_hmax_lat.setText(t("max_latency"))
         self.btn_clear_hist.setText(t("clear_history"))
         self.btn_export.setText(t("export"))
         self.btn_clear_log.setText(t("clear_log"))
@@ -670,11 +736,22 @@ class MainWindow(QMainWindow):
     def _backend(self) -> str:
         return self.combo_backend.currentData() or "auto"
 
+    def _set_ping(self, ping_ms: float | None) -> None:
+        self._last_ping_ms = ping_ms
+        value = f"{ping_ms:.2f}" if ping_ms is not None else "—"
+        self.lbl_latency.setText(f"{tr(self.lang, 'ping')}: {value}")
+
     def _unit_changed(self, unit: str):
         description = SPEED_DESCRIPTIONS[unit][1 if self.lang == "fa" else 0]
         self.unit_description.setText(f"{unit} ({description})")
         self.gauge_down.set_unit(unit)
         self.gauge_up.set_unit(unit)
+        if self._last_download_mbps is not None:
+            self.gauge_down.reset()
+            self.gauge_down.set_value(convert_speed(self._last_download_mbps, unit))
+        if self._last_upload_mbps is not None:
+            self.gauge_up.reset()
+            self.gauge_up.set_value(convert_speed(self._last_upload_mbps, unit))
         self._refresh_history()
 
     # ------------------------------------------------------------- servers
@@ -762,10 +839,10 @@ class MainWindow(QMainWindow):
             size = "—"
         self.download_status.setText(tr(self.lang, "ookla_ready").format(path=path, size=size))
         self.btn_download.setText(tr(self.lang, "redownload_ookla"))
-        self.log_line(f"✓ Ookla CLI downloaded ({size}): {path}")
-        index = self.combo_backend.findData("ookla")
-        if index >= 0:
-            self.combo_backend.setCurrentIndex(index)
+        self.log_line(
+            f"✓ Ookla CLI downloaded ({size}): {path}. Auto keeps the live built-in "
+            "engine first; choose Ookla manually for its final-only result."
+        )
         QMessageBox.information(
             self,
             tr(self.lang, "download_done_title"),
@@ -868,6 +945,11 @@ class MainWindow(QMainWindow):
                 return
         self.gauge_down.reset()
         self.gauge_up.reset()
+        self._last_download_mbps = None
+        self._last_upload_mbps = None
+        self._set_ping(None)
+        self.lbl_server.setText(f"{tr(self.lang, 'jitter_server')}: —")
+        self.lbl_live.clear()
         self.chart.clear_chart()
         self.progress_bar.setValue(0)
         self.lbl_status.setText(
@@ -897,19 +979,36 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(tr(self.lang, "ready"))
             self.progress_bar.setValue(100 if self.progress_bar.value() else 0)
 
-    def _on_progress(self, phase: str, mbps: float, done: int):
+    def _on_progress(self, phase: str, value: float, done: int):
         unit = self.combo_unit.currentText()
+        if phase == "starting":
+            self.gauge_down.reset()
+            self.gauge_up.reset()
+            self._last_download_mbps = None
+            self._last_upload_mbps = None
+            self._set_ping(None)
+            self.lbl_server.setText(f"{tr(self.lang, 'jitter_server')}: —")
+            self.lbl_live.clear()
+            return
+        if phase == "latency":
+            self._set_ping(value)
+            return
         if phase == "download":
-            self.gauge_down.set_value(convert_speed(mbps, unit))
+            self._last_download_mbps = value
+            self.gauge_down.set_value(convert_speed(value, unit))
         elif phase == "upload":
-            self.gauge_up.set_value(convert_speed(mbps, unit))
-        if phase in ("download", "upload"):
-            self.chart.push(phase, mbps)
-            self.lbl_live.setText(
-                f"{tr(self.lang, 'live')}: {phase} "
-                f"{convert_speed(mbps, unit):.2f} {unit}  ({format_size(done)})"
-            )
-            self.progress_bar.setValue(50 if phase == "download" else 90)
+            self._last_upload_mbps = value
+            self.gauge_up.set_value(convert_speed(value, unit))
+        else:
+            return
+
+        self.chart.push(phase, value)
+        phase_label = tr(self.lang, phase)
+        self.lbl_live.setText(
+            f"{tr(self.lang, 'live')}: {phase_label} "
+            f"{convert_speed(value, unit):.2f} {unit}  ({format_size(done)})"
+        )
+        self.progress_bar.setValue(50 if phase == "download" else 90)
 
     def _on_record(self, record: dict):
         try:
@@ -917,13 +1016,21 @@ class MainWindow(QMainWindow):
         except CheckerError as exc:
             self.log_line(f"✗ history: {exc}")
         self._refresh_history()
+        self._set_ping(record.get("latency_ms"))
+        self.lbl_server.setText(
+            f"{tr(self.lang, 'jitter_server')}: {record['location']} ({record['server']})"
+        )
         if record.get("download_mbps") is not None:
             unit = self.combo_unit.currentText()
-            self.gauge_down.set_value(convert_speed(record["download_mbps"], unit))
-            self.gauge_up.set_value(convert_speed(record["upload_mbps"], unit))
-            self.lbl_latency.setText(f"{tr(self.lang, 'latency')}: {record['latency_ms']} ms")
+            self._last_download_mbps = record["download_mbps"]
+            self._last_upload_mbps = record["upload_mbps"]
+            self.gauge_down.reset()
+            self.gauge_up.reset()
+            self.gauge_down.set_value(convert_speed(self._last_download_mbps, unit))
+            self.gauge_up.set_value(convert_speed(self._last_upload_mbps, unit))
+        elif record.get("status") == "error":
             self.lbl_server.setText(
-                f"{tr(self.lang, 'jitter_server')}: {record['location']} ({record['server']})"
+                f"{self.lbl_server.text()} — {record.get('error', '')}"
             )
         self.tabs.setCurrentIndex(0)
 

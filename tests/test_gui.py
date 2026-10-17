@@ -77,7 +77,10 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(records[0]["connection"], "direct")
         self.assertEqual(records[0]["repeat"], 1)
         self.assertTrue(all(r["connection"] == "vpn" for r in records[1:]))
+        self.assertTrue(all(r["latency_ms"] is not None for r in records))
         self.assertEqual(window.history_table.rowCount(), 3)
+        self.assertEqual(window.history_table.horizontalHeaderItem(5).text(), "Ping (ms)")
+        self.assertIn("Ping", window.lbl_latency.text())
         window.history_table.sortItems(3)
         self.assertLessEqual(window.history_table.item(0, 3).data(0x0100),
                              window.history_table.item(1, 3).data(0x0100))
@@ -159,7 +162,7 @@ class GuiTests(unittest.TestCase):
         window.search.clear()
         self.assertEqual([s.city for s in window._selected_servers()], ["Frankfurt", "Berlin"])
 
-    def test_auto_engine_falls_back_and_remembers(self):
+    def test_auto_engine_uses_live_builtin_then_remembers_ookla_fallback(self):
         from unittest.mock import Mock, patch
 
         from speedchecker.gui import TestWorker
@@ -169,8 +172,8 @@ class GuiTests(unittest.TestCase):
         worker = TestWorker("single", window._payload([]))
         worker.payload["backend"] = "auto"
         ookla, builtin = Mock(), Mock()
-        ookla.measure.side_effect = CheckerError("speedtest exited with code 2: Cannot write")
-        builtin.measure.return_value = Measurement(1.0, 2.0, 3.0, "h", "l")
+        builtin.measure.side_effect = CheckerError("server list temporarily unavailable")
+        ookla.measure.return_value = Measurement(1.0, 2.0, 3.0, "h", "l")
         with (
             patch("speedchecker.gui.bundled_speedtest_binary", return_value="speedtest"),
             patch("speedchecker.gui.OoklaSpeedtest", return_value=ookla),
@@ -178,10 +181,33 @@ class GuiTests(unittest.TestCase):
         ):
             engine = worker._engine(None)
             self.assertEqual(engine.measure().download_mbps, 1.0)
-            self.assertTrue(worker._prefer_builtin)
-            # Later servers in the same run go straight to the built-in engine.
-            self.assertIs(worker._engine(None), builtin)
+            self.assertTrue(worker._prefer_ookla)
+            # Later servers in this run go straight to the working fallback.
+            self.assertIs(worker._engine(None), ookla)
+            self.assertEqual(builtin.measure.call_count, 1)
             self.assertEqual(ookla.measure.call_count, 1)
+
+    def test_explicit_ookla_failure_falls_back_for_direct_baseline(self):
+        from unittest.mock import Mock, patch
+
+        from speedchecker.gui import TestWorker
+        from speedchecker.models import CheckerError, Measurement
+
+        window = MainWindow()
+        worker = TestWorker("single", window._payload([]))
+        worker.payload["backend"] = "ookla"
+        ookla, builtin = Mock(), Mock()
+        ookla.measure.side_effect = CheckerError("Protocol error: Did not receive HELLO")
+        builtin.measure.return_value = Measurement(8.0, 2.0, 21.0, "test-host", "Test")
+        with (
+            patch("speedchecker.gui.bundled_speedtest_binary", return_value="speedtest"),
+            patch("speedchecker.gui.OoklaSpeedtest", return_value=ookla),
+            patch.object(worker, "_builtin_engine", return_value=builtin),
+        ):
+            engine = worker._engine(None)
+            self.assertEqual(engine.measure().latency_ms, 21.0)
+            self.assertTrue(worker._prefer_builtin)
+            self.assertIs(worker._engine(None), builtin)
 
     def test_download_reports_progress_and_result(self):
         from unittest.mock import patch
@@ -206,6 +232,15 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(done, ["/tmp/fake-speedtest"])
         self.assertEqual(failed, [])
 
+    def test_downloading_ookla_does_not_disable_live_auto_mode(self):
+        from unittest.mock import patch
+
+        window = MainWindow()
+        self.assertEqual(window._backend(), "auto")
+        with patch("speedchecker.gui.QMessageBox.information"):
+            window._on_downloaded("/not/a/real/binary")
+        self.assertEqual(window._backend(), "auto")
+
     def test_download_failure_is_reported(self):
         from unittest.mock import patch
 
@@ -220,8 +255,66 @@ class GuiTests(unittest.TestCase):
             worker.run()
         self.assertEqual(failed, ["boom"])
 
+    def test_live_progress_updates_gauges_ping_and_unit_changes(self):
+        window = MainWindow()
+        window.combo_unit.setCurrentText("MB/s")
+        window._on_progress("starting", 0, 0)
+        window._on_progress("latency", 23.5, 0)
+        window._on_progress("download", 8.0, 1_000_000)
+        window._on_progress("upload", 4.0, 500_000)
+        self.assertIn("23.50", window.lbl_latency.text())
+        self.assertAlmostEqual(window.gauge_down._value, 1.0)
+        self.assertAlmostEqual(window.gauge_up._value, 0.5)
+        self.assertLess(window.gauge_down._max, 10)
+        self.assertEqual(list(window.chart.download), [8.0])
+        self.assertEqual(list(window.chart.upload), [4.0])
+        window.combo_unit.setCurrentText("Mbps")
+        self.assertAlmostEqual(window.gauge_down._value, 8.0)
+        self.assertAlmostEqual(window.gauge_up._value, 4.0)
+
+    def test_live_speed_updates_are_throttled_not_dropped(self):
+        from unittest.mock import patch
+
+        from speedchecker.gui import TestWorker
+
+        window = MainWindow()
+        worker = TestWorker("single", window._payload([]))
+        received = []
+        worker.progress.connect(lambda *event: received.append(event))
+        with patch("speedchecker.gui.time.monotonic", side_effect=[1.0, 1.05, 1.11]):
+            worker._emit_progress("download", 10.0, 100)
+            worker._emit_progress("download", 11.0, 200)
+            worker._emit_progress("download", 12.0, 300)
+        self.assertEqual([event[1] for event in received], [10.0, 12.0])
+
+    def test_ping_is_saved_when_throughput_phase_fails(self):
+        from unittest.mock import Mock, patch
+
+        from speedchecker.gui import TestWorker
+        from speedchecker.models import CheckerError
+        from speedchecker.servers import Server
+
+        window = MainWindow()
+        worker = TestWorker("single", window._payload([]))
+        worker.payload["backend"] = "builtin"
+        engine = Mock()
+
+        def fail_after_ping():
+            worker._emit_progress("latency", 31.75, 0)
+            raise CheckerError("download failed")
+
+        engine.measure.side_effect = fail_after_ping
+        server = Server(host="direct", city="Without VPN", sponsor="Baseline")
+        with patch.object(worker, "_engine", return_value=engine):
+            record = worker._measure_server(server, None)
+        self.assertEqual(record["status"], "error")
+        self.assertEqual(record["latency_ms"], 31.75)
+
     def test_gauge_value_and_scale(self):
         gauge = GaugeWidget("Download")
+        gauge.set_unit("MB/s")
+        gauge.set_value(1.25)
+        self.assertEqual(gauge._max, 2)
         gauge.set_value(250)
         self.assertGreaterEqual(gauge._max, 250)
 

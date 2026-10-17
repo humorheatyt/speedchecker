@@ -105,7 +105,7 @@ class BenchmarkTests(unittest.TestCase):
         report = self.run_benchmark()
         self.assertEqual(report["Status"], "completed")
         self.assertEqual(report["Baseline"]["SuccessfulTests"], 2)
-        self.assertEqual(report["WithoutVPN"], "100.50Mbps ▼  40.75Mbps ▲")
+        self.assertEqual(report["WithoutVPN"], "100.50Mbps ▼  40.75Mbps ▲  10.25ms ping")
         self.assertEqual(report["VPNStats"][0]["VPNLatency"], "10.25ms")
         self.assertEqual(report["VPNStats"][0]["LocationName"], "Canada, Toronto")
         self.vpn.connect.assert_called_once_with("canada-toronto")

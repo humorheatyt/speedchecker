@@ -45,7 +45,7 @@ def positive_float(value: str) -> float:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Benchmark ExpressVPN locations using the official Ookla Speedtest CLI.",
+        description="Benchmark direct and ExpressVPN speeds with the built-in or Ookla engine.",
         epilog="Tests consume substantial data. VPN connections made by this tool are disconnected "
         "after testing. Use --demo for an offline simulation without network changes.",
     )
@@ -98,8 +98,8 @@ def parser() -> argparse.ArgumentParser:
         "--engine",
         choices=("auto", "builtin", "ookla"),
         default="auto",
-        help="speed engine: auto = bundled vendor/ Ookla binary if present, else the "
-        "built-in pure-Python engine shipped in this repo (default: auto)",
+        help="speed engine: auto = built-in pure-Python engine first, then the bundled "
+        "vendor/ Ookla binary on failure; builtin/ookla force one engine (default: auto)",
     )
     return result
 
@@ -120,34 +120,42 @@ def main(argv: list[str] | None = None) -> int:
             speedtest = DemoSpeedtest(vpn)
             print("DEMO: synthetic measurements; no network or VPN changes.")
         else:
-            use_ookla = args.engine == "ookla" or (
-                args.engine == "auto" and bundled_speedtest_binary() is not None
-            )
+            binary = bundled_speedtest_binary()
             check_dependencies(require_speedtest_binary=args.engine == "ookla")
             vpn = ExpressVPN(
                 command_timeout=args.command_timeout,
                 connection_timeout=args.connection_timeout,
             )
-            if use_ookla:
+            if args.engine == "ookla":
                 speedtest = OoklaSpeedtest(
                     timeout=args.speedtest_timeout,
                     accept_license=args.accept_license,
                     log=print,
                 )
-                if args.engine == "auto":
-                    # Keep "auto" truly automatic: a transient Ookla failure
-                    # must not abort the whole run when the bundled engine works.
-                    speedtest = FallbackSpeedtest(
-                        speedtest,
-                        lambda: BuiltinSpeedtest(timeout=args.speedtest_timeout, log=print),
-                        log=print,
-                    )
             else:
-                print(
-                    "Using the built-in speed engine bundled with this project "
-                    "(no external speedtest binary)."
-                )
-                speedtest = BuiltinSpeedtest(timeout=args.speedtest_timeout, log=print)
+                builtin = BuiltinSpeedtest(timeout=args.speedtest_timeout, log=print)
+                if args.engine == "auto" and binary is not None:
+                    print(
+                        "Auto: using the live built-in engine first; the Ookla binary "
+                        "will be used if the built-in test fails."
+                    )
+                    speedtest = FallbackSpeedtest(
+                        builtin,
+                        lambda: OoklaSpeedtest(
+                            timeout=args.speedtest_timeout,
+                            accept_license=args.accept_license,
+                            log=print,
+                        ),
+                        log=print,
+                        primary_name="built-in",
+                        fallback_name="Ookla",
+                    )
+                else:
+                    print(
+                        "Using the built-in speed engine bundled with this project "
+                        "(no external speedtest needed)."
+                    )
+                    speedtest = builtin
         output = args.output or Path(
             "results-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
         )

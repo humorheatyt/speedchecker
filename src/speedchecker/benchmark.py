@@ -84,7 +84,13 @@ def benchmark(
         baseline = run_batch(speedtest, count, serial).summary()
         report["Baseline"] = baseline
         report["WithoutVPN"] = (
-            f"{baseline['DownloadMbps']:.2f}Mbps ▼  {baseline['UploadMbps']:.2f}Mbps ▲"
+            f"{baseline['DownloadMbps']:.2f}Mbps ▼  {baseline['UploadMbps']:.2f}Mbps ▲  "
+            f"{baseline['LatencyMs']:.2f}ms ping"
+        )
+        log(
+            f"Without VPN: {baseline['DownloadMbps']:.2f} Mbps down / "
+            f"{baseline['UploadMbps']:.2f} Mbps up / "
+            f"{baseline['LatencyMs']:.2f} ms ping"
         )
         store.save(report)
         for location in locations:
