@@ -6,10 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
-  gists: write
-  actions: write
 
 jobs:
   test:
@@ -51,10 +49,13 @@ jobs:
       - name: Show pytest log on failure
         if: env.PYTEST_EXIT != '0'
         run: cat /tmp/pytest.log
-      - name: Create gist on failure
-        if: failure()
+      - name: Comment PR on failure
+        if: failure() && github.event_name == 'pull_request'
         run: |
-          gh gist create /tmp/pytest.log --public --desc "pytest log ${{ matrix.python }} ${{ matrix.os }}" || true
+          gh pr comment ${{ github.event.pull_request.number }} --body "### Pytest failure ${{ matrix.python }} ${{ matrix.os }}
+          \`\`\`
+          $(cat /tmp/pytest.log | head -c 50000)
+          \`\`\`" || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: python app.py --cli --help
