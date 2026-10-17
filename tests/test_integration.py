@@ -77,6 +77,8 @@ class SubprocessIntegrationTests(unittest.TestCase):
                 "speedchecker",
                 str(self.input),
                 "--accept-license",
+                "--engine",
+                "ookla",
                 "-r",
                 "3",
                 "--output",
