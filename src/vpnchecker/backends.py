@@ -93,9 +93,8 @@ class OoklaSpeedtest:
         return Measurement.from_json(self.runner.run(args, self.timeout))
 
 
-def check_dependencies(require_speedtest=True) -> None:
-    names = ("expressvpnctl", "speedtest") if require_speedtest else ("expressvpnctl",)
-    missing = [name for name in names if not shutil.which(name)]
+def check_dependencies() -> None:
+    missing = [name for name in ("expressvpnctl", "speedtest") if not shutil.which(name)]
     if missing:
         raise CheckerError("Missing executable(s) in PATH: " + ", ".join(missing))
 
