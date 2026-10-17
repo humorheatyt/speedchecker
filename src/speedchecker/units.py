@@ -17,6 +17,18 @@ SPEED_UNITS: dict[str, float] = {
     "KiB/s": 122.0703125,
 }
 
+SPEED_DESCRIPTIONS = {
+    "Mbps": ("megabits per second", "مگابیت بر ثانیه"),
+    "Gbps": ("gigabits per second", "گیگابیت بر ثانیه"),
+    "Kbps": ("kilobits per second", "کیلوبیت بر ثانیه"),
+    "bps": ("bits per second", "بیت بر ثانیه"),
+    "MB/s": ("megabytes per second", "مگابایت بر ثانیه"),
+    "GB/s": ("gigabytes per second", "گیگابایت بر ثانیه"),
+    "KB/s": ("kilobytes per second", "کیلوبایت بر ثانیه"),
+    "MiB/s": ("mebibytes per second (1024² bytes)", "مبی‌بایت بر ثانیه (۱۰۲۴² بایت)"),
+    "KiB/s": ("kibibytes per second (1024 bytes)", "کیبی‌بایت بر ثانیه (۱۰۲۴ بایت)"),
+}
+
 SIZE_UNITS: dict[str, float] = {  # unit -> bytes
     "B": 1,
     "KB": 1_000,
