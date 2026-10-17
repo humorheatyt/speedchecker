@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from vpnchecker.backends import DemoSpeedtest, DemoVPN
-from vpnchecker.benchmark import benchmark, run_batch
-from vpnchecker.models import CheckerError, Location, Measurement
-from vpnchecker.storage import ReportStore
+from speedchecker.backends import DemoSpeedtest, DemoVPN
+from speedchecker.benchmark import benchmark, run_batch
+from speedchecker.models import CheckerError, Location, Measurement
+from speedchecker.storage import ReportStore
 
 SAMPLE = Measurement(100.5, 40.75, 10.25, "demo.invalid", "Test")
 
@@ -66,7 +66,7 @@ class StorageTests(unittest.TestCase):
             store = ReportStore(path)
             store.reserve()
             store.save({"old": True})
-            with patch("vpnchecker.storage.os.replace", side_effect=OSError("denied")):
+            with patch("speedchecker.storage.os.replace", side_effect=OSError("denied")):
                 with self.assertRaises(CheckerError):
                     store.save({"new": True})
             self.assertEqual(json.loads(path.read_text()), {"old": True})
@@ -179,6 +179,65 @@ class BenchmarkTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report["Status"], "interrupted")
         self.assertIsNotNone(report["Baseline"])
+
+    def test_progress_and_report_callbacks_are_live(self):
+        events = []
+        reports = []
+        report = benchmark(
+            [Location("Canada", "Toronto")],
+            self.vpn,
+            self.speed,
+            self.store,
+            count=2,
+            serial=True,
+            display_unit="MB/s",
+            latency_unit="s",
+            progress=events.append,
+            report_callback=reports.append,
+            log=lambda _: None,
+        )
+        self.assertEqual(report["Settings"]["DisplayUnit"], "MB/s")
+        self.assertEqual(report["Settings"]["LatencyUnit"], "s")
+        self.assertTrue(any(event["type"] == "sample" for event in events))
+        self.assertTrue(any(event["type"] == "baseline_complete" for event in events))
+        self.assertTrue(any(event["type"] == "location_complete" for event in events))
+        self.assertEqual(events[-1]["type"], "job_finished")
+        self.assertEqual(reports[-1]["Status"], "completed")
+
+    def test_stop_requested_before_baseline_saves_interrupted_report(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        with self.assertRaises(KeyboardInterrupt):
+            benchmark(
+                [Location("Canada", "Toronto")],
+                self.vpn,
+                self.speed,
+                self.store,
+                count=2,
+                stop_event=stop_event,
+                log=lambda _: None,
+            )
+        self.speed.measure.assert_not_called()
+        self.vpn.connect.assert_not_called()
+        self.assertEqual(self.report()["Status"], "interrupted")
+
+    def test_stop_during_vpn_test_still_disconnects(self):
+        stop_event = threading.Event()
+        calls = 0
+
+        def measure():
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                stop_event.set()
+            return SAMPLE
+
+        self.speed.measure.side_effect = measure
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_benchmark(stop_event=stop_event)
+        self.vpn.disconnect.assert_called_once()
+        self.assertEqual(self.report()["Status"], "interrupted")
+        self.assertEqual(len(self.report()["VPNStats"]), 1)
 
     def test_demo_is_marked_synthetic(self):
         vpn = DemoVPN(["canada"])

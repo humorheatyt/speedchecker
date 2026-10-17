@@ -73,9 +73,11 @@ class SubprocessIntegrationTests(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "vpnchecker",
+                "speedchecker",
                 str(self.input),
                 "--accept-license",
+                "--speedtest-backend",
+                "ookla",
                 "-r",
                 "3",
                 "--output",

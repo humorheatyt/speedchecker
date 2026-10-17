@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vpnchecker.models import Batch, CheckerError, Location, Measurement, load_locations
+from speedchecker.models import Batch, CheckerError, Location, Measurement, load_locations
 
 
 def payload(download=12_562_500, upload=5_093_750, latency=10.25):

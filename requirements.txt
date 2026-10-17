@@ -1,0 +1,4 @@
+# Runtime dependency for the live dashboard.
+Flask>=3.0,<4
+# Install the local app and its packaged Speedtest engine.
+-e .

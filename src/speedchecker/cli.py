@@ -1,4 +1,4 @@
-"""CLI entry point shared by vpnchecker and expressvpnspeedtest."""
+"""CLI entry point shared by speedchecker and its legacy command aliases."""
 
 import argparse
 import math
@@ -8,10 +8,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .backends import DemoSpeedtest, DemoVPN, ExpressVPN, OoklaSpeedtest, check_dependencies
+from .backends import (
+    BundledSpeedtest,
+    DemoSpeedtest,
+    DemoVPN,
+    ExpressVPN,
+    OoklaSpeedtest,
+    check_dependencies,
+)
 from .benchmark import benchmark
 from .models import CheckerError, load_locations, slug
 from .storage import ReportStore
+from .units import SPEED_UNITS
 
 
 def positive_int(value: str) -> int:
@@ -36,9 +44,12 @@ def positive_float(value: str) -> float:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Benchmark ExpressVPN locations using the official Ookla Speedtest CLI.",
-        epilog="Tests consume substantial data. VPN connections made by this tool are disconnected "
-        "after testing. Use --demo for an offline simulation without network changes.",
+        description="Measure internet speed and compare ExpressVPN locations.",
+        epilog=(
+            "Tests can consume substantial data. VPN connections made by this tool are "
+            "disconnected after testing. The built-in Speedtest engine needs no separate "
+            "Ookla CLI installation; use --demo for an offline simulation."
+        ),
     )
     result.add_argument("input_file", type=Path, help="JSON file containing a locations array")
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -53,6 +64,12 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "-o", "--output", type=Path, help="new JSON report path (never overwritten)"
+    )
+    result.add_argument(
+        "--unit",
+        choices=tuple(SPEED_UNITS),
+        default="Mbps",
+        help="speed display unit stored in the report settings (default: Mbps)",
     )
     result.add_argument(
         "--command-timeout",
@@ -70,7 +87,7 @@ def parser() -> argparse.ArgumentParser:
         "--speedtest-timeout",
         type=positive_float,
         default=180,
-        help="timeout per speed test in seconds (default: 180)",
+        help="timeout for each built-in or Ookla speed measurement (default: 180)",
     )
     result.add_argument(
         "--disconnect-existing",
@@ -78,9 +95,15 @@ def parser() -> argparse.ArgumentParser:
         help="allow disconnecting an existing VPN; it will NOT be restored",
     )
     result.add_argument(
+        "--speedtest-backend",
+        choices=("bundled", "ookla"),
+        default="bundled",
+        help="bundled Python engine (default) or optional official Ookla CLI",
+    )
+    result.add_argument(
         "--accept-license",
         action="store_true",
-        help="explicitly accept Ookla's license and GDPR terms for the Speedtest CLI",
+        help="accept Ookla terms when --speedtest-backend=ookla is selected",
     )
     result.add_argument(
         "--demo", action="store_true", help="use simulated data; no external commands"
@@ -89,7 +112,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if args.accept_license and args.speedtest_backend != "ookla":
+        argument_parser.error("--accept-license only applies to --speedtest-backend=ookla")
+
     old_handler = None
     handler_installed = False
     try:
@@ -104,15 +131,18 @@ def main(argv: list[str] | None = None) -> int:
             speedtest = DemoSpeedtest(vpn)
             print("DEMO: synthetic measurements; no network or VPN changes.")
         else:
-            check_dependencies()
+            check_dependencies(require_ookla=args.speedtest_backend == "ookla")
             vpn = ExpressVPN(
                 command_timeout=args.command_timeout,
                 connection_timeout=args.connection_timeout,
             )
-            speedtest = OoklaSpeedtest(
-                timeout=args.speedtest_timeout,
-                accept_license=args.accept_license,
-            )
+            if args.speedtest_backend == "ookla":
+                speedtest = OoklaSpeedtest(
+                    timeout=args.speedtest_timeout,
+                    accept_license=args.accept_license,
+                )
+            else:
+                speedtest = BundledSpeedtest(timeout=args.speedtest_timeout)
         output = args.output or Path(
             "results-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
         )
@@ -120,7 +150,6 @@ def main(argv: list[str] | None = None) -> int:
         def interrupt(signum, frame):
             raise KeyboardInterrupt
 
-        # Let SIGTERM follow the same cleanup path as Ctrl+C.
         old_handler = signal.signal(signal.SIGTERM, interrupt)
         handler_installed = True
         report = benchmark(
@@ -132,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             serial=args.serial,
             disconnect_existing=args.disconnect_existing,
             demo=args.demo,
+            display_unit=args.unit,
         )
         print(f"Report: {output} ({report['Status']})")
         return 0 if report["Status"] == "completed" else 1

@@ -1,0 +1,7 @@
+Bundled upstream component: speedtest-cli 2.1.3
+Author: Matt Martz
+Source distribution: speedtest_cli-2.1.3 from PyPI (https://pypi.org/project/speedtest-cli/)
+Upstream repository: https://github.com/sivel/speedtest-cli
+License: Apache License 2.0; see LICENSE-speedtest-cli.txt.
+The vendored source is retained in this repository so no separate speedtest executable or
+speedtest-cli package installation is required. It is used as a Python library by Speedchecker.

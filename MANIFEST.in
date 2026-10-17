@@ -1,2 +1,6 @@
-include LICENSE README.md README.fa.md locations.json
+include LICENSE README.md README.fa.md requirements.txt locations.json app.py
+recursive-include src/speedchecker/templates *.html
+recursive-include src/speedchecker/static *.css *.js
+recursive-include src/speedchecker/data *.json
+recursive-include src/speedchecker/_vendor *.py *.txt
 recursive-include tests *.py

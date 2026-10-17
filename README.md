@@ -1,79 +1,77 @@
-# vpnchecker — Python ExpressVPN Speed Test
+# Speedchecker — Live internet speed & ExpressVPN dashboard
 
-A complete Python port of [toriqo/expressvpnspeedtest](https://github.com/toriqo/expressvpnspeedtest).
-Measure your connection without a VPN, benchmark multiple ExpressVPN locations, and save
-averaged download/upload speeds, latency, connection time, and individual samples to JSON.
+A Python app for measuring your connection and comparing ExpressVPN locations. It includes a
+responsive, Persian-language live dashboard, a command-line interface, JSON reports, and an
+offline demo. The repository/package is named **speedchecker**.
 
-**[راهنمای فارسی](README.fa.md)** · Python **3.10+** · MIT · No Python runtime dependencies
+**[راهنمای فارسی](README.fa.md)** · Python **3.10+** · MIT · Runs on Windows, macOS and Linux
 
-> This is a command-line application, not a VPN service. Real benchmarks still use the
-> installed **ExpressVPN `expressvpnctl`** and **official Ookla `speedtest`** executables,
-> just as the Go original did. No Go compiler or Go source is needed.
-
-## Quick start (offline demo)
+## Quick start
 
 ```bash
-git clone https://github.com/humorheatyt/vpnchecker.git
-cd vpnchecker
-# Until the Python port PR is merged, check out its branch:
-git checkout arena/7b469e38-vpnchecker
-python3 -m venv .venv
-source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install .
-
-vpnchecker --demo -s -r 3 locations.json
+git clone https://github.com/humorheatyt/speedchecker.git
+cd speedchecker
+python -m venv .venv
+# macOS/Linux:
+source .venv/bin/activate
+# Windows PowerShell:
+# .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python app.py
 ```
 
-The demo requires **neither ExpressVPN nor Speedtest**, never changes your network, and
-marks every report with `"Demo": true`. Its numbers are synthetic, not actual speed tests.
-The equivalent entry points are `python -m vpnchecker` and `expressvpnspeedtest`.
+Open **http://127.0.0.1:8000**. The dashboard starts in safe demo mode; click **Start test**
+to see the live UI without touching the network. Demo results are synthetic and are clearly
+labelled. Turn off **Demo mode** when you are ready to run a real test.
 
-## Real benchmarks
+The dashboard includes live download/upload/ping readings, a speed chart, per-location results,
+a JSON download, test-count and serial/parallel settings, and adjustable display units such as
+`Mbps`, `MB/s`, `Kbps`, `KB/s`, `Gbps`, `GB/s`, `bps`, `B/s`, `KiB/s`, `MiB/s`, and `GiB/s`.
+Latency can also be displayed in milliseconds, seconds, or microseconds. Changing units updates
+the dashboard immediately; saved measurements remain normalized to Mbps for accuracy.
 
-1. Install and activate ExpressVPN with your subscription. This implementation targets
-   the **`expressvpnctl` interface**, not the older `expressvpn` CLI. Confirm:
+## Speedtest is bundled — no separate CLI install
+
+The project vendors the open-source **speedtest-cli 2.1.3** Python implementation in
+`src/speedchecker/_vendor/`, including its Apache-2.0 license. Speedchecker uses it directly as
+a library, so you do **not** need to download/install the separate `speedtest` executable or the
+`speedtest-cli` PyPI package. `pip install -r requirements.txt` installs the app and its web
+runtime dependencies; the speed-test engine is already in the clone and in the built package.
+
+This bundled engine is not Ookla's proprietary official CLI. An optional adapter for the
+official Ookla `speedtest` executable remains available with
+`--speedtest-backend ookla`; that optional mode still requires the executable and explicit
+`--accept-license`. The default bundled engine does not require either.
+
+> A real ExpressVPN comparison still needs an active ExpressVPN installation exposing
+> `expressvpnctl` and an authenticated account. Speedchecker is a benchmark tool, not a VPN
+> service. The GUI and demo work without ExpressVPN.
+
+## Real VPN benchmarks
+
+1. Install and activate ExpressVPN on a supported machine. This project targets the
+   `expressvpnctl` interface. Verify:
    ```bash
    expressvpnctl get regions
    expressvpnctl get connectionstate
    ```
-2. Install the [official Ookla Speedtest CLI](https://www.speedtest.net/apps/cli).
-   The unrelated Python package named `speedtest-cli` is **not compatible** with its JSON
-   schema/arguments. Run `speedtest` interactively once to review its terms, or explicitly
-   pass `--accept-license` to accept the license and GDPR terms during a benchmark.
-3. Disconnect your VPN, edit `locations.json`, and run:
+2. Disconnect your current VPN before measuring the baseline. In the dashboard, turn off
+   **Demo mode** and start a test. The CLI equivalent is:
    ```bash
-   # Three consecutive measurements per baseline/location (recommended for comparison)
-   vpnchecker -s -r 3 locations.json
-
-   # Five concurrent measurements per baseline/location (original default)
-   vpnchecker locations.json
-
-   # Explicit report path and explicit Ookla terms acceptance
-   vpnchecker -s -r 3 --accept-license -o results-my-run.json locations.json
+   speedchecker -s -r 3 locations.json
    ```
+3. If an ExpressVPN connection is already active, Speedchecker refuses to disconnect it unless
+   you explicitly enable **Allow disconnecting the current VPN** in the GUI, or add
+   `--disconnect-existing` in the CLI. The original connection is **not restored** after the run.
 
-### Network safety and measurement limits
+Speed tests can consume substantial bandwidth/data. Serial tests are recommended for meaningful
+comparisons; parallel tests compete for the same connection. The app connects to configured VPN
+locations one at a time and disconnects in a cleanup step after each attempt.
 
-- Speed tests can consume substantial bandwidth/data. Concurrent tests compete for the
-  same connection; their **mean**, not their sum, is reported. Serial mode is usually
-  easier to interpret. Parallel workers are capped at 32; all requested tests still run.
-- A baseline intentionally measures **without ExpressVPN**. Do not use this tool if you
-  require uninterrupted VPN protection. Other VPNs, proxies, or tunnels are not detected.
-- An existing or transitioning ExpressVPN connection is left untouched unless you pass
-  `--disconnect-existing`. With that option it is disconnected before the baseline and
-  **is not restored** after the run. Unknown state values are rejected without this option.
-- Locations are connected **one at a time**. After every attempted connection the tool
-  disconnects in a `finally` block, even if connecting or testing failed. Cleanup failures
-  abort further locations. Check your VPN manually if a disconnect command fails.
-- Ctrl+C and SIGTERM request cleanup and save completed batches. Active parallel speed
-  tests may take up to their timeout to finish first. Forced termination (SIGKILL), power
-  loss, or repeated interruption cannot guarantee cleanup. Previously saved snapshots remain.
-- Automatic reconnect/always-on modes and Network Lock may prevent disconnection or the
-  baseline test. Check your client's configuration; the tool does not disable security settings.
-- Real mode requires a platform/client version exposing the commands above. Demo mode and
-  Python unit tests are portable; installing Python alone does not add platform VPN support.
+## Location list
 
-## Input format
+Edit the root `locations.json` file to select VPN locations supported by your current
+ExpressVPN client. Example:
 
 ```json
 {
@@ -86,70 +84,60 @@ The equivalent entry points are `python -m vpnchecker` and `expressvpnspeedtest`
 }
 ```
 
-`country` is required; `city` and `region` are optional strings. Obtain current region IDs
-from `expressvpnctl get regions`; the checked-in locations are examples, not a guaranteed
-current server directory. Matching is case-insensitive and normalizes spaces/underscores
-to hyphens. The exact `country-city` region takes precedence over a country-only region.
-If no city matches, a country-only ID is used **only if that exact ID exists**. The tool
-never chooses an arbitrary city. An explicit `region` overrides matching, with no fallback.
-Unmatched locations are recorded as errors and skipped. Empty or malformed inputs are rejected.
+`country` is required; `city` and `region` are optional. Find current region IDs with
+`expressvpnctl get regions`. An explicit `region` must match exactly (case-insensitive); without
+one, the city-country region takes priority. The sample list is not a guarantee that these
+locations are still available on your account.
 
-## Options
+## CLI options
 
 ```text
-vpnchecker [options] input_file
+speedchecker [options] input_file
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `-h`, `--help` | Show usage |
 | `--version` | Show version |
-| `-s`, `--serial` | Consecutive tests instead of concurrent tests |
-| `-r N`, `--repeat N` | Number of tests per baseline and location; default 5, minimum 1 |
-| `--repeatSpeedTest N` | Compatibility alias for `--repeat` |
-| `-o PATH`, `--output PATH` | New JSON output path; existing files are never overwritten |
-| `--command-timeout SEC` | Timeout per ExpressVPN subprocess; default 30 |
-| `--connection-timeout SEC` | Timeout per connection/disconnection state wait; default 60 |
+| `-s`, `--serial` | Run measurements one after another |
+| `-r N`, `--repeat N` | Tests per baseline/location; default 5 |
+| `-o PATH`, `--output PATH` | New JSON report path; existing files are never overwritten |
+| `--unit UNIT` | Save the preferred speed display unit in report settings |
+| `--command-timeout SEC` | Timeout per ExpressVPN command; default 30 |
+| `--connection-timeout SEC` | Timeout for VPN state waits; default 60 |
 | `--speedtest-timeout SEC` | Timeout per speed measurement; default 180 |
-| `--disconnect-existing` | Consent to disconnecting an existing VPN before the baseline |
-| `--accept-license` | Pass Ookla's `--accept-license` and `--accept-gdpr` switches |
-| `--demo` | Offline synthetic measurements; no external programs or network changes |
+| `--disconnect-existing` | Explicitly allow disconnecting an existing VPN |
+| `--demo` | Offline synthetic measurements; no network/VPN changes |
+| `--speedtest-backend bundled` | Use the included Python engine (default) |
+| `--speedtest-backend ookla` | Optional official Ookla CLI adapter |
+| `--accept-license` | Accept Ookla terms for the optional `ookla` backend |
 
-The state wait begins **after** its connect/disconnect command completes; each command and
-wait has its own bound. All timeouts must be finite and positive.
+Other launch options are `python app.py`, `python -m speedchecker`, and the legacy
+`vpnchecker` / `expressvpnspeedtest` command names. The separately bundled Speedtest module can
+also be run with `speedchecker-speedtest`.
 
-Exit codes: **0** = complete success, **1** = failure or partial results (including skipped
-locations/failed samples), **2** = invalid CLI usage, **130** = interrupted.
+Exit codes: **0** = complete success, **1** = failure or partial results, **2** = invalid CLI
+usage, **130** = interrupted.
 
-## Reports
+## Reports and data safety
 
-Default filename: `results-<UTC timestamp with microseconds>.json`. A new report is reserved
-without overwriting another run, then updated with atomic JSON snapshots after the baseline
-and each location. Output parent directories are created automatically. A failed location
-cannot erase previous results. An all-failed baseline aborts before connecting any location.
+The dashboard offers the latest saved report as JSON. CLI reports are written to
+`results-<UTC timestamp>.json` by default; a path passed with `-o` is never overwritten. Snapshots
+are saved atomically after the baseline and every VPN location. A report includes machine name,
+OS, selected settings, raw Mbps results, samples, location/server details, and any errors. Review
+it before sharing; `results-*.json` is ignored by Git.
 
-The original fields are retained: `MachineName`, `OS`, `WithoutVPN`, and `VPNStats`, with
-`LocationName`, `TimeToConnect`, `VPNDownloadSpeed`, `VPNUploadSpeed`, `VPNLatency`, `Server`,
-`Date/Time`, and `Mode` on each VPN row. Schema version 2 additionally includes:
+The baseline is intentionally measured without ExpressVPN. Existing VPN connections are left
+untouched unless you explicitly consent to disconnecting them. A connection made by the tool is
+always disconnected after a location test, and the app does not reconnect it afterward. Automatic
+reconnect, Network Lock, other VPNs and proxies can affect measurements. Ctrl+C in the CLI or
+**Stop safely** in the dashboard finishes the current measurement and attempts VPN cleanup; a
+forced process kill or power loss cannot guarantee cleanup.
 
-- `Demo`, `Status`, `StartedAt`, `FinishedAt`, and `Settings`;
-- `Baseline`: averaged numeric measurements and all successful baseline samples;
-- per-row `Region`, `DownloadMbps`, `UploadMbps`, `LatencyMs`, `SuccessfulTests`, `FailedTests`,
-  `Samples`, and `Errors`;
-- top-level `Errors` for skipped locations and connection/run failures.
-
-Bandwidth in Ookla's JSON is **bytes/second** and is divided by **125,000** to obtain decimal
-Mbps. Averages use full precision for **all three metrics**, including the baseline.
-Formatted legacy strings use two decimal places. Failed samples are excluded from averages
-and counted, never treated as zero. `LocationName` names the requested **VPN location**;
-`Samples[].server_location` names the separate **Speedtest server location**. `Server` lists
-all distinct test hosts used, while individual samples preserve their provenance.
-Timestamps are ISO 8601 UTC. Status is `running`, `completed`, `partial`, `failed`, or
-`interrupted`. A saved `running` snapshot can indicate an abruptly terminated process.
-
-Reports include the machine hostname, operating system and tested locations. Review them
-before sharing; `results-*.json` files are intentionally ignored by Git. If you choose a
-custom filename, keep that report out of version control yourself.
+`app.py` binds to `0.0.0.0` so Arena's preview and other local interfaces can reach it. Run the
+control dashboard only on a trusted machine/network; it can initiate speed tests and VPN
+connections. Set `SPEEDCHECKER_HOST=127.0.0.1` to restrict it to loopback when running locally.
+Use `PORT=8000` or `SPEEDCHECKER_PORT` to change the port.
 
 ## Development and verification
 
@@ -161,31 +149,13 @@ ruff format --check .
 python -m build
 ```
 
-The test suite covers input/schema validation, fractional unit conversion, exact region
-priority, serial/parallel execution, baseline averaging, subprocess errors/timeouts,
-license opt-in, connection polling, interruption cleanup, partial results, atomic writes,
-CLI entry points and offline end-to-end runs. Tests do not require VPN credentials or run
-real internet speed tests. GitHub Actions tests Python 3.10–3.14 on Linux and Python 3.12 on
-Windows/macOS, checks formatting, and builds/installs the wheel.
+Tests use mocks and offline demo data; they do not require ExpressVPN credentials or make real
+speed tests. The web UI has no CDN/runtime asset dependencies.
 
-```text
-src/vpnchecker/
-  cli.py         Arguments, exit codes, entry point
-  models.py      Locations, validated Speedtest samples, averages
-  backends.py    ExpressVPN/Ookla subprocesses and offline simulators
-  benchmark.py   Measurement orchestration and cleanup
-  storage.py     Atomic JSON reports
-```
+## License and attribution
 
-## Porting notes and attribution
-
-Ported from [toriqo/expressvpnspeedtest](https://github.com/toriqo/expressvpnspeedtest) at
-commit `311c65a8f68fa35031bc83f54f2fc314d072eb19`. The original MIT license and Flavius Andrei's
-copyright notice are preserved in [LICENSE](LICENSE).
-
-This is a Python reimplementation of the original workflow, not a wrapper around Go.
-There are no Go sources, modules, or build steps. It deliberately fixes the original's
-last-sample-only baseline, rounded-before-average bandwidth, last-sample latency,
-country-before-city matching, and unbounded connection polling. It adds validation,
-explicit handling of existing connections, partial reports, and offline testing.
-Neither project is affiliated with ExpressVPN or Ookla.
+This project is MIT-licensed. The bundled `speedtest-cli` source is Copyright 2012 Matt Martz and
+is licensed under Apache-2.0; its license and provenance notice are included beside the source.
+The VPN comparison workflow is a Python port of
+[toriqo/expressvpnspeedtest](https://github.com/toriqo/expressvpnspeedtest). Speedchecker is not
+affiliated with ExpressVPN or Ookla.

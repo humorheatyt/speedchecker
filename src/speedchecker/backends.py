@@ -1,9 +1,12 @@
-"""External CLIs are invoked without a shell, with bounded command/state waits."""
+"""Network backends for ExpressVPN, bundled Speedtest and offline demos."""
 
+import math
 import shutil
 import subprocess
 import time
+from urllib.parse import urlparse
 
+from ._vendor import speedtest as bundled_speedtest
 from .models import CheckerError, Measurement
 
 
@@ -80,7 +83,63 @@ class ExpressVPN:
         self._wait_for("disconnected")
 
 
+class BundledSpeedtest:
+    """Run the vendored speedtest-cli Python engine without a separate binary."""
+
+    def __init__(self, timeout=180.0, speedtest_factory=None):
+        self.timeout = timeout
+        self.speedtest_factory = speedtest_factory or bundled_speedtest.Speedtest
+
+    @staticmethod
+    def _number(value, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CheckerError(f"Bundled Speedtest returned an invalid {label} value.")
+        result = float(value)
+        if not math.isfinite(result) or result < 0:
+            raise CheckerError(f"Bundled Speedtest returned a non-finite {label} value.")
+        return result
+
+    def measure(self) -> Measurement:
+        try:
+            engine = self.speedtest_factory(timeout=self.timeout, secure=True)
+            selected_server = engine.get_best_server()
+            download_bps = self._number(engine.download(), "download")
+            upload_bps = self._number(engine.upload(pre_allocate=False), "upload")
+            result = engine.results.dict()
+            server = result.get("server") or selected_server or {}
+            if not isinstance(server, dict):
+                raise CheckerError("Bundled Speedtest returned invalid server metadata.")
+
+            host = (
+                server.get("host") or server.get("url") or server.get("sponsor") or server.get("id")
+            )
+            if host is None:
+                host = "Unknown speedtest server"
+            host = str(host)
+            parsed_host = urlparse(host).netloc
+            if parsed_host:
+                host = parsed_host
+            country = server.get("country", "")
+            location = server.get("location") or server.get("name") or ""
+            server_location = ", ".join(str(value) for value in (country, location) if value)
+            latency = result.get("ping", getattr(engine.results, "ping", None))
+            return Measurement(
+                download_bps / 1_000_000,
+                upload_bps / 1_000_000,
+                self._number(latency, "latency"),
+                host,
+                server_location,
+            )
+        except CheckerError:
+            raise
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            raise CheckerError(f"Bundled Speedtest failed: {message}") from exc
+
+
 class OoklaSpeedtest:
+    """Optional adapter for users who specifically want Ookla's official CLI."""
+
     def __init__(self, runner=None, timeout=180.0, accept_license=False):
         self.runner = runner or CommandRunner()
         self.timeout = timeout
@@ -93,8 +152,12 @@ class OoklaSpeedtest:
         return Measurement.from_json(self.runner.run(args, self.timeout))
 
 
-def check_dependencies() -> None:
-    missing = [name for name in ("expressvpnctl", "speedtest") if not shutil.which(name)]
+def check_dependencies(require_ookla: bool = True) -> None:
+    """Check ExpressVPN and, optionally, Ookla's non-bundled command-line app."""
+    required = ["expressvpnctl"]
+    if require_ookla:
+        required.append("speedtest")
+    missing = [name for name in required if not shutil.which(name)]
     if missing:
         raise CheckerError("Missing executable(s) in PATH: " + ", ".join(missing))
 

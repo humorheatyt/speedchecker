@@ -3,36 +3,44 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vpnchecker"
-version = "1.0.0"
-description = "Python ExpressVPN speed benchmarking CLI"
+name = "speedchecker"
+version = "2.0.0"
+description = "Live internet speed and ExpressVPN benchmarking dashboard"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{name = "vpnchecker contributors"}]
-dependencies = []
+authors = [{name = "speedchecker contributors"}]
+dependencies = ["Flask>=3.0,<4"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Environment :: Console",
+  "Environment :: Web Environment",
 ]
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "ruff>=0.9"]
 
 [project.scripts]
-vpnchecker = "vpnchecker.cli:main"
-expressvpnspeedtest = "vpnchecker.cli:main"
+speedchecker = "speedchecker.cli:main"
+speedchecker-speedtest = "speedchecker.speedtest_cli:main"
+# Compatibility command names for previous releases.
+vpnchecker = "speedchecker.cli:main"
+expressvpnspeedtest = "speedchecker.cli:main"
 
 [project.urls]
-Repository = "https://github.com/humorheatyt/vpnchecker"
+Repository = "https://github.com/humorheatyt/speedchecker"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+speedchecker = ["templates/*.html", "static/*.css", "static/*.js", "data/*.json", "_vendor/*.txt"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["src/speedchecker/_vendor/speedtest.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

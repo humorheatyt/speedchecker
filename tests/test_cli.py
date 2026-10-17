@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vpnchecker.cli import main, parser
+from speedchecker.cli import main, parser
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,7 +38,7 @@ class CLITests(unittest.TestCase):
     def test_demo_does_not_check_external_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.json"
-            with patch("vpnchecker.cli.check_dependencies") as check:
+            with patch("speedchecker.cli.check_dependencies") as check:
                 with contextlib.redirect_stdout(io.StringIO()):
                     code = main([str(ROOT / "locations.json"), "--demo", "-o", str(path)])
             self.assertEqual(code, 0)
@@ -52,7 +52,7 @@ class CLITests(unittest.TestCase):
                 cmd = [
                     sys.executable,
                     "-m",
-                    "vpnchecker",
+                    "speedchecker",
                     str(ROOT / "locations.json"),
                     "--demo",
                     "-r",
