@@ -3,8 +3,24 @@
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 from .models import CheckerError, Measurement
+
+
+def bundled_speedtest_binary() -> Path | None:
+    """Ookla binary bundled with the project: ``<repo>/vendor/speedtest[.exe]``.
+
+    Drop the official binary there and it is used automatically — no
+    system-wide ``speedtest`` installation needed. Falls back to PATH.
+    """
+    root = Path(__file__).resolve().parents[2]
+    for name in ("speedtest.exe", "speedtest"):
+        candidate = root / "vendor" / name
+        if candidate.is_file():
+            return candidate
+    found = shutil.which("speedtest")
+    return Path(found) if found else None
 
 
 class CommandRunner:
@@ -81,22 +97,35 @@ class ExpressVPN:
 
 
 class OoklaSpeedtest:
-    def __init__(self, runner=None, timeout=180.0, accept_license=False):
+    def __init__(self, runner=None, timeout=180.0, accept_license=False, server_id: str = ""):
         self.runner = runner or CommandRunner()
         self.timeout = timeout
         self.accept_license = accept_license
+        self.server_id = server_id
 
     def measure(self) -> Measurement:
-        args = ["speedtest", "--format=json", "--progress=no"]
+        binary = bundled_speedtest_binary()
+        if binary is None:
+            raise CheckerError(
+                "No Ookla speedtest binary found. Put it in vendor/ (see vendor/README.md), "
+                "add it to PATH, or use the built-in engine."
+            )
+        args = [str(binary), "--format=json", "--progress=no"]
+        if self.server_id:
+            args.append(f"--server-id={self.server_id}")
         if self.accept_license:
             args.extend(["--accept-license", "--accept-gdpr"])
         return Measurement.from_json(self.runner.run(args, self.timeout))
 
 
-def check_dependencies() -> None:
-    missing = [name for name in ("expressvpnctl", "speedtest") if not shutil.which(name)]
+def check_dependencies(require_speedtest_binary: bool = False) -> None:
+    missing = []
+    if not shutil.which("expressvpnctl"):
+        missing.append("expressvpnctl")
+    if require_speedtest_binary and bundled_speedtest_binary() is None:
+        missing.append("speedtest (vendor/ or PATH)")
     if missing:
-        raise CheckerError("Missing executable(s) in PATH: " + ", ".join(missing))
+        raise CheckerError("Missing executable(s): " + ", ".join(missing))
 
 
 class DemoVPN:

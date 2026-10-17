@@ -12,3 +12,5 @@ htmlcov/
 results-*.json
 .env
 .DS_Store
+vendor/*
+!vendor/README.md

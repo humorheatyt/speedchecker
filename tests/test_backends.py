@@ -5,8 +5,8 @@ from unittest.mock import Mock, patch
 
 from test_models import payload
 
-from vpnchecker.backends import CommandRunner, ExpressVPN, OoklaSpeedtest, check_dependencies
-from vpnchecker.models import CheckerError
+from speedchecker.backends import CommandRunner, ExpressVPN, OoklaSpeedtest, check_dependencies
+from speedchecker.models import CheckerError
 
 
 class CommandTests(unittest.TestCase):
@@ -31,15 +31,20 @@ class CommandTests(unittest.TestCase):
 
     def test_missing_executable(self):
         with self.assertRaisesRegex(CheckerError, "Cannot run"):
-            CommandRunner().run(["vpnchecker-nonexistent-binary"], 1)
+            CommandRunner().run(["speedchecker-nonexistent-binary"], 1)
 
-    @patch("vpnchecker.backends.shutil.which", return_value=None)
+    @patch("speedchecker.backends.shutil.which", return_value=None)
     def test_dependencies(self, which):
-        with self.assertRaisesRegex(CheckerError, "expressvpnctl, speedtest"):
+        # speedtest binary is optional now (built-in engine is bundled);
+        # it is only required when explicitly requested.
+        with self.assertRaisesRegex(CheckerError, "expressvpnctl"):
             check_dependencies()
+        with self.assertRaisesRegex(CheckerError, r"expressvpnctl, speedtest \(vendor/ or PATH\)"):
+            check_dependencies(require_speedtest_binary=True)
 
-    @patch("vpnchecker.backends.subprocess.run")
-    def test_json_stdout_is_separate_from_stderr(self, run):
+    @patch("speedchecker.backends.bundled_speedtest_binary", return_value="speedtest")
+    @patch("speedchecker.backends.subprocess.run")
+    def test_json_stdout_is_separate_from_stderr(self, run, _binary):
         run.return_value = subprocess.CompletedProcess([], 0, payload(), "some warning")
         result = OoklaSpeedtest().measure()
         self.assertEqual(result.download_mbps, 100.5)
@@ -59,7 +64,7 @@ class VPNTests(unittest.TestCase):
         with self.assertRaises(CheckerError):
             ExpressVPN(runner).regions()
 
-    @patch("vpnchecker.backends.time.sleep")
+    @patch("speedchecker.backends.time.sleep")
     def test_connection_polling(self, sleep):
         runner = Mock()
         runner.run.side_effect = ["", "Connecting", " Connected\n"]
@@ -83,7 +88,8 @@ class VPNTests(unittest.TestCase):
             runner.run.call_args_list[1].args[0], ["expressvpnctl", "get", "connectionstate"]
         )
 
-    def test_ookla_license_is_opt_in(self):
+    @patch("speedchecker.backends.bundled_speedtest_binary", return_value="speedtest")
+    def test_ookla_license_is_opt_in(self, _binary):
         runner = Mock()
         runner.run.return_value = payload()
         OoklaSpeedtest(runner).measure()

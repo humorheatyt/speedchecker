@@ -58,6 +58,7 @@ class SubprocessIntegrationTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
             "FAKE_VPN_STATE": str(self.root / "state"),
         }
         for name, source in [("expressvpnctl", VPN_SCRIPT), ("speedtest", SPEED_SCRIPT)]:
@@ -73,7 +74,7 @@ class SubprocessIntegrationTests(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "vpnchecker",
+                "speedchecker",
                 str(self.input),
                 "--accept-license",
                 "-r",

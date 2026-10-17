@@ -1,4 +1,4 @@
-"""CLI entry point shared by vpnchecker and expressvpnspeedtest."""
+"""CLI entry point shared by speedchecker and expressvpnspeedtest."""
 
 import argparse
 import math
@@ -8,8 +8,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .backends import DemoSpeedtest, DemoVPN, ExpressVPN, OoklaSpeedtest, check_dependencies
+from .backends import (
+    DemoSpeedtest,
+    DemoVPN,
+    ExpressVPN,
+    OoklaSpeedtest,
+    bundled_speedtest_binary,
+    check_dependencies,
+)
 from .benchmark import benchmark
+from .engine import BuiltinSpeedtest
 from .models import CheckerError, load_locations, slug
 from .storage import ReportStore
 
@@ -85,6 +93,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--demo", action="store_true", help="use simulated data; no external commands"
     )
+    result.add_argument(
+        "--engine",
+        choices=("auto", "builtin", "ookla"),
+        default="auto",
+        help="speed engine: auto = bundled vendor/ Ookla binary if present, else the "
+        "built-in pure-Python engine shipped in this repo (default: auto)",
+    )
     return result
 
 
@@ -104,15 +119,25 @@ def main(argv: list[str] | None = None) -> int:
             speedtest = DemoSpeedtest(vpn)
             print("DEMO: synthetic measurements; no network or VPN changes.")
         else:
-            check_dependencies()
+            use_ookla = args.engine == "ookla" or (
+                args.engine == "auto" and bundled_speedtest_binary() is not None
+            )
+            check_dependencies(require_speedtest_binary=args.engine == "ookla")
             vpn = ExpressVPN(
                 command_timeout=args.command_timeout,
                 connection_timeout=args.connection_timeout,
             )
-            speedtest = OoklaSpeedtest(
-                timeout=args.speedtest_timeout,
-                accept_license=args.accept_license,
-            )
+            if use_ookla:
+                speedtest = OoklaSpeedtest(
+                    timeout=args.speedtest_timeout,
+                    accept_license=args.accept_license,
+                )
+            else:
+                print(
+                    "Using the built-in speed engine bundled with this project "
+                    "(no external speedtest binary)."
+                )
+                speedtest = BuiltinSpeedtest(timeout=args.speedtest_timeout, log=print)
         output = args.output or Path(
             "results-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
         )
