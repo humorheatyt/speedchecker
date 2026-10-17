@@ -1,12 +1,12 @@
 """Tests for the v2 features: units, servers, engine, history, i18n, bundled binary."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from speedchecker import engine as engine_module
 from speedchecker.backends import bundled_speedtest_binary
 from speedchecker.engine import DemoSpeedtestLive
 from speedchecker.history import HistoryStore, filter_history
@@ -179,14 +179,19 @@ class EngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "vendor").mkdir()
-            binary = root / "vendor" / "speedtest"
+            # On Windows the .exe candidate is preferred; on POSIX the plain name.
+            binary = root / "vendor" / ("speedtest.exe" if os.name == "nt" else "speedtest")
             binary.write_text("#!/bin/sh\n")
             fake_file = root / "src" / "speedchecker" / "backends.py"
             fake_file.parent.mkdir(parents=True)
             fake_file.write_text("")
-            with patch.object(engine_module, "__name__", "speedchecker.engine"):
-                with patch("speedchecker.backends.__file__", str(fake_file)):
-                    self.assertEqual(bundled_speedtest_binary(), binary)
+            with patch("speedchecker.backends.__file__", str(fake_file)):
+                found = bundled_speedtest_binary()
+            self.assertIsNotNone(found)
+            # Windows: TemporaryDirectory may use the 8.3 short name
+            # (e.g. RUNNER~1) while resolve() returns the long name
+            # (runneradmin) — compare resolved paths, not raw strings.
+            self.assertEqual(found.resolve(), binary.resolve())
 
 
 class I18nTests(unittest.TestCase):
