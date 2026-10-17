@@ -1,3 +1,3 @@
-"""ExpressVPN benchmarking in Python, with no Python runtime dependencies."""
+"""Speedchecker core (legacy internal namespace retained for compatibility)."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
