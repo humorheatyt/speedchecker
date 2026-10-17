@@ -173,10 +173,20 @@ class TestWorker(QThread):
         binary = bundled_speedtest_binary()
         if backend == "auto":
             if self._prefer_ookla and binary:
+                # Keep a live fallback to built-in so a VPN tunnel with
+                # broken DNS for Ookla's config service can still be
+                # measured via the cached server list.
                 self.log.emit(
-                    "Engine: Ookla (Auto fallback from earlier in this run; final result only)"
+                    "Engine: Ookla (Auto fallback from earlier; built-in fallback if needed)"
                 )
-                return self._ookla_engine(server)
+                return FallbackSpeedtest(
+                    self._ookla_engine(server),
+                    lambda: self._builtin_engine(server),
+                    log=self.log.emit,
+                    on_fallback=lambda: None,
+                    primary_name="Ookla",
+                    fallback_name="built-in",
+                )
             builtin = self._builtin_engine(server)
             if binary:
                 self.log.emit("Engine: built-in (Auto primary; live progress; Ookla fallback)")
@@ -194,9 +204,16 @@ class TestWorker(QThread):
         if backend == "ookla":
             if self._prefer_builtin:
                 self.log.emit(
-                    "Engine: built-in (Ookla fallback from earlier in this run; live progress)"
+                    "Engine: built-in (Ookla fallback from earlier; Ookla fallback if needed)"
                 )
-                return self._builtin_engine(server)
+                return FallbackSpeedtest(
+                    self._builtin_engine(server),
+                    lambda: self._ookla_engine(server),
+                    log=self.log.emit,
+                    on_fallback=lambda: None,
+                    primary_name="built-in",
+                    fallback_name="Ookla",
+                )
             self.log.emit("Ookla reports final results only; choose Auto/Built-in for live gauges.")
             return FallbackSpeedtest(
                 self._ookla_engine(server),
@@ -984,6 +1001,8 @@ class MainWindow(QMainWindow):
         if phase == "starting":
             self.gauge_down.reset()
             self.gauge_up.reset()
+            self.chart.clear_chart()
+            self.progress_bar.setValue(0)
             self._last_download_mbps = None
             self._last_upload_mbps = None
             self._set_ping(None)

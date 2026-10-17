@@ -165,6 +165,7 @@ class GuiTests(unittest.TestCase):
     def test_auto_engine_uses_live_builtin_then_remembers_ookla_fallback(self):
         from unittest.mock import Mock, patch
 
+        from speedchecker.backends import FallbackSpeedtest
         from speedchecker.gui import TestWorker
         from speedchecker.models import CheckerError, Measurement
 
@@ -182,14 +183,26 @@ class GuiTests(unittest.TestCase):
             engine = worker._engine(None)
             self.assertEqual(engine.measure().download_mbps, 1.0)
             self.assertTrue(worker._prefer_ookla)
-            # Later servers in this run go straight to the working fallback.
-            self.assertIs(worker._engine(None), ookla)
+            # Later servers keep Ookla as primary but retain a live
+            # fallback to built-in so VPN tests with broken DNS can still
+            # be measured via the cached server list.
+            second = worker._engine(None)
+            self.assertIsInstance(second, FallbackSpeedtest)
+            self.assertIs(second.primary, ookla)
+            self.assertEqual(second.measure().download_mbps, 1.0)
             self.assertEqual(builtin.measure.call_count, 1)
-            self.assertEqual(ookla.measure.call_count, 1)
+            self.assertEqual(ookla.measure.call_count, 2)
+            # If that Ookla then also fails (e.g. HostNotFound via VPN),
+            # the same wrapper falls back to built-in.
+            ookla.measure.side_effect = CheckerError("HostNotFound: Couldn't resolve host")
+            builtin.measure.side_effect = None
+            builtin.measure.return_value = Measurement(9.0, 9.0, 9.0, "h2", "l2")
+            self.assertEqual(second.measure().download_mbps, 9.0)
 
     def test_explicit_ookla_failure_falls_back_for_direct_baseline(self):
         from unittest.mock import Mock, patch
 
+        from speedchecker.backends import FallbackSpeedtest
         from speedchecker.gui import TestWorker
         from speedchecker.models import CheckerError, Measurement
 
@@ -207,7 +220,10 @@ class GuiTests(unittest.TestCase):
             engine = worker._engine(None)
             self.assertEqual(engine.measure().latency_ms, 21.0)
             self.assertTrue(worker._prefer_builtin)
-            self.assertIs(worker._engine(None), builtin)
+            second = worker._engine(None)
+            self.assertIsInstance(second, FallbackSpeedtest)
+            self.assertIs(second.primary, builtin)
+            self.assertEqual(second.measure().latency_ms, 21.0)
 
     def test_download_reports_progress_and_result(self):
         from unittest.mock import patch
