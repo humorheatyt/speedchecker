@@ -32,12 +32,13 @@ jobs:
       - run: python -m pip install -r requirements.txt pytest
       - run: |
           set -o pipefail
-          python -m pytest tests/ -v --tb=short 2>&1 | tee /tmp/pytest.log
+          python -m pytest tests/ -v --tb=short 2>&1 | tee "${{ runner.temp }}/pytest.log"
+        shell: bash
       - name: Upload pytest log
         uses: actions/upload-artifact@v4
         with:
           name: pytest-log-${{ matrix.python }}-${{ matrix.os }}
-          path: /tmp/pytest.log
+          path: ${{ runner.temp }}/pytest.log
         if: always()
       - name: Comment PR on failure
         if: ${{ failure() && github.event_name == 'pull_request' }}
@@ -45,7 +46,9 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const log = fs.readFileSync('/tmp/pytest.log', 'utf8');
+            const path = require('path');
+            const logPath = path.join(process.env.RUNNER_TEMP, 'pytest.log');
+            const log = fs.readFileSync(logPath, 'utf8');
             const body = '### Pytest failure ${{ matrix.python }} ${{ matrix.os }}\n```\n' + log.slice(0, 50000) + '\n```';
             await github.rest.issues.createComment({
               owner: context.repo.owner,
